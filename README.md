@@ -3,12 +3,14 @@
 Легковесный проект для работы с GigE-камерой Baumer на macOS:
 
 - live preview GUI (`Tkinter`)
+- Hydra calibration/capture GUI with face segmentation/classification workflow
 - scientific RAW capture sessions (`.npy + .json`)
 - инструменты обнаружения и восстановления IP камеры
 
 ## Что в репозитории
 
-- `tools/baumer_live_gui.py` - основное GUI-приложение
+- `tools/baumer_hydra_gui.py` - Hydra GUI: calibration, capture, analysis, face segmentation/classification
+- `tools/baumer_live_gui.py` - легковесное live preview GUI
 - `tools/baumer_capture_one.py` - CLI захват кадров/сессий
 - `tools/baumer_gvcp_explorer.py` - discovery камер по GVCP
 - `tools/baumer_force_ip.py` - временная смена IP камеры (FORCEIP)
@@ -17,14 +19,19 @@
 - `tools/camera_control.py` - scientific camera configuration
 - `tools/raw_decode.py` - raw decode layer
 - `tools/capture_session.py` - session writer
+- `tools/hsi_recon_worker.py` - worker для HSI-реконструкции в analysis/classification pipeline
+- `tools/train_face_spectrum_classifier.py` - обучение простого спектрального face classifier
+- `weights/` - lightweight config/metadata для реконструкции и классификации
 - `docs/macos-network-setup.md` - подробный сетевой гайд
 
 ## Требования
 
 - macOS
 - Homebrew
-- Python `3.14` (рекомендуется `/opt/homebrew/bin/python3.14`)
+- Python `3.14`
 - Aravis + `gi.repository` (PyGObject)
+- Tkinter для Python 3.14
+- локальные checkpoint-файлы реконструкции в `weights/` (не хранятся в git)
 
 ## Развертывание
 
@@ -32,27 +39,77 @@
 
 ```bash
 git clone <YOUR_REPO_URL>
-cd BaumerCamera
+cd HydraSoft
 ```
 
 ### 2) Системные зависимости (Homebrew)
 
 ```bash
 brew update
-brew install aravis pygobject3 gobject-introspection pkg-config
+brew install python@3.14 python-tk@3.14 aravis pygobject3 gobject-introspection pkg-config
 ```
 
 ### 3) Python-зависимости
 
+Рекомендуемый вариант - локальное виртуальное окружение в корне проекта:
+
 ```bash
-/opt/homebrew/bin/python3.14 -m pip install --break-system-packages -r requirements.txt
+/opt/homebrew/opt/python@3.14/bin/python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Если `gi.repository` не виден из `.venv`, разрешите окружению видеть Homebrew site-packages:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+p = Path(".venv/pyvenv.cfg")
+s = p.read_text()
+s = s.replace("include-system-site-packages = false", "include-system-site-packages = true")
+p.write_text(s)
+PY
 ```
 
 ### 4) Быстрая проверка
 
 ```bash
-/opt/homebrew/bin/python3.14 tools/baumer_live_gui.py --help
-/opt/homebrew/bin/python3.14 tools/baumer_capture_one.py --help
+source .venv/bin/activate
+python -c "import tkinter; import gi; gi.require_version('Aravis', '0.8'); from gi.repository import Aravis; print('Tk/Aravis OK')"
+python -m py_compile tools/baumer_hydra_gui.py tools/baumer_capture_one.py
+python tools/baumer_capture_one.py --help
+```
+
+### 5) Локальные веса
+
+Большие checkpoint-файлы не коммитятся. Для HSI-реконструкции положите их в `weights/`:
+
+```text
+weights/weights.ckpt
+weights/weights_base.ckpt          # optional
+weights/weights_for_shpak.ckpt     # optional
+```
+
+Лёгкие файлы `weights/config.yaml`, `weights/wavelengths.txt` и
+`weights/face_cls_model.json` можно хранить в git.
+
+### 6) Запуск Hydra GUI
+
+```bash
+cd /path/to/HydraSoft
+source .venv/bin/activate
+GST_PLUGIN_PATH=/opt/homebrew/opt/aravis/lib/gstreamer-1.0 python tools/baumer_hydra_gui.py
+```
+
+Если окно Tk падает при запуске из sandboxed terminal, запустите ту же команду из обычного macOS Terminal.
+
+### 7) Запуск lightweight live GUI
+
+```bash
+cd /path/to/HydraSoft
+source .venv/bin/activate
+GST_PLUGIN_PATH=/opt/homebrew/opt/aravis/lib/gstreamer-1.0 python tools/baumer_live_gui.py
 ```
 
 ## Настройки сети
@@ -78,7 +135,8 @@ sudo ifconfig <CAMERA_IFACE> inet 192.168.88.10 netmask 255.255.255.0 up
 ### 3) Проверить discovery
 
 ```bash
-/opt/homebrew/bin/python3.14 tools/baumer_gvcp_explorer.py \
+source .venv/bin/activate
+python tools/baumer_gvcp_explorer.py \
   --interface <CAMERA_IFACE> \
   --duration 4
 ```
@@ -92,7 +150,8 @@ sudo ifconfig <CAMERA_IFACE> inet 192.168.88.10 netmask 255.255.255.0 up
 ### 4) Если камера в wrong subnet - применить FORCEIP
 
 ```bash
-/opt/homebrew/bin/python3.14 tools/baumer_force_ip.py \
+source .venv/bin/activate
+python tools/baumer_force_ip.py \
   --interface <CAMERA_IFACE> \
   --mac <CAMERA_MAC> \
   --ip <TARGET_CAMERA_IP> \
@@ -122,16 +181,30 @@ bash tools/baumer_network_diagnose.sh <CAMERA_IFACE>
 #### GUI (основной режим)
 
 ```bash
-/opt/homebrew/bin/python3.14 tools/baumer_live_gui.py
+source .venv/bin/activate
+GST_PLUGIN_PATH=/opt/homebrew/opt/aravis/lib/gstreamer-1.0 python tools/baumer_hydra_gui.py
 ```
 
 GUI больше не подставляет «чужие» дефолтные значения IP/interface.  
 Сначала укажите `Interface` и `Camera IP` в окне, либо нажмите `Auto Find/Fix`.
 
+#### Analysis / Classification в Hydra GUI
+
+Для работы кнопок `Анализ` и `Classification` должны быть выполнены условия:
+
+- есть live frame с камеры;
+- завершена calibration/crop настройка;
+- задана white point;
+- выбрана `Segmentation lens` от 1 до 16;
+- face segmentation model загружена;
+- HSI reconstruction precheck прошёл успешно;
+- для `Classification` дополнительно загружен `weights/face_cls_model.json`.
+
 ### CLI: scientific session (1 кадр)
 
 ```bash
-/opt/homebrew/bin/python3.14 tools/baumer_capture_one.py \
+source .venv/bin/activate
+python tools/baumer_capture_one.py \
   --camera <CAMERA_IP> \
   --interface <CAMERA_IFACE> \
   --scientific-session \
@@ -143,7 +216,8 @@ GUI больше не подставляет «чужие» дефолтные �
 ### CLI: burst (например dark frames)
 
 ```bash
-/opt/homebrew/bin/python3.14 tools/baumer_capture_one.py \
+source .venv/bin/activate
+python tools/baumer_capture_one.py \
   --camera <CAMERA_IP> \
   --interface <CAMERA_IFACE> \
   --scientific-session \

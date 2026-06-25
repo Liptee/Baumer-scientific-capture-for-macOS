@@ -56,12 +56,21 @@ except Exception:
     FAST_PREVIEW_AVAILABLE = False
 
 try:
-    from scipy.ndimage import convolve, convolve1d
+    import cv2
+
+    CV2_AVAILABLE = True
+except Exception:
+    cv2 = None  # type: ignore[assignment]
+    CV2_AVAILABLE = False
+
+try:
+    from scipy.ndimage import convolve, convolve1d, gaussian_filter
 
     SCIPY_DEMOSAIC_AVAILABLE = True
 except Exception:
     convolve = None  # type: ignore[assignment]
     convolve1d = None  # type: ignore[assignment]
+    gaussian_filter = None  # type: ignore[assignment]
     SCIPY_DEMOSAIC_AVAILABLE = False
 
 try:
@@ -106,6 +115,9 @@ class FramePacket:
 
 
 def get_interface_ipv4(interface: str) -> str | None:
+    entries = get_interface_ipv4_entries(interface)
+    if entries:
+        return entries[0][0]
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         packed = struct.pack("256s", interface[:15].encode("ascii", errors="ignore"))
@@ -136,6 +148,32 @@ def get_interface_netmask(interface: str) -> str | None:
     return None
 
 
+def _decode_ifconfig_netmask(token: str) -> str:
+    if token.startswith("0x"):
+        try:
+            return socket.inet_ntoa(struct.pack(">I", int(token, 16)))
+        except Exception:
+            return "255.255.255.0"
+    return token
+
+
+def get_interface_ipv4_entries(interface: str) -> list[tuple[str, str]]:
+    try:
+        out = subprocess.check_output(["ifconfig", interface], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    entries: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 4 or parts[0] != "inet" or parts[2] != "netmask":
+            continue
+        ip = parts[1]
+        if ip.startswith("127."):
+            continue
+        entries.append((ip, _decode_ifconfig_netmask(parts[3])))
+    return entries
+
+
 def ip_to_int(ip: str) -> int:
     return int.from_bytes(socket.inet_aton(ip), "big", signed=False)
 
@@ -146,6 +184,17 @@ def same_subnet(ip_a: str, ip_b: str, mask: str) -> bool:
         return (ip_to_int(ip_a) & ma) == (ip_to_int(ip_b) & ma)
     except Exception:
         return False
+
+
+def get_interface_ipv4_for_peer(interface: str, peer_ip: str) -> str | None:
+    entries = get_interface_ipv4_entries(interface)
+    if not entries:
+        return get_interface_ipv4(interface)
+    if is_ipv4_literal(peer_ip):
+        for ip, mask in entries:
+            if same_subnet(ip, peer_ip, mask):
+                return ip
+    return entries[0][0]
 
 
 def suggest_camera_ip(host_ip: str) -> str:
@@ -165,6 +214,68 @@ def suggest_camera_ip(host_ip: str) -> str:
 
 def ipv4_to_u32(value: str) -> int:
     return int.from_bytes(socket.inet_aton(value), "big", signed=False)
+
+
+def is_ipv4_literal(value: str) -> bool:
+    try:
+        socket.inet_aton(value)
+        return value.count(".") == 3
+    except OSError:
+        return False
+
+
+def open_camera_with_fallback(Aravis, camera_id: str, interface: str) -> tuple[object | None, str]:
+    errors: list[str] = []
+
+    try:
+        camera = Aravis.Camera.new(camera_id)
+        if camera is not None:
+            return camera, ""
+        errors.append("Aravis.Camera.new returned None")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Aravis.Camera.new failed: {exc}")
+
+    if not is_ipv4_literal(camera_id):
+        return None, "; ".join(errors)
+
+    try:
+        from gi.repository import Gio  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Gio import failed for GvDevice fallback: {exc}")
+        return None, "; ".join(errors)
+
+    if_ip = get_interface_ipv4_for_peer(interface, camera_id)
+    if not if_ip:
+        errors.append(f"Interface {interface} has no IPv4 for GvDevice fallback")
+        return None, "; ".join(errors)
+
+    try:
+        iface_addr = Gio.InetAddress.new_from_string(if_ip)
+        dev_addr = Gio.InetAddress.new_from_string(camera_id)
+        if iface_addr is None or dev_addr is None:
+            raise RuntimeError("Failed to parse interface/camera IPv4")
+        device = Aravis.GvDevice.new(iface_addr, dev_addr)
+        camera = Aravis.Camera.new_with_device(device)
+        if camera is None:
+            raise RuntimeError("Aravis.Camera.new_with_device returned None")
+        return camera, "opened via GvDevice fallback"
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"GvDevice fallback failed: {exc}")
+        return None, "; ".join(errors)
+
+
+def configure_aravis_gige_interface(Aravis, interface: str) -> None:
+    try:
+        Aravis.GvInterface.set_discovery_interface_name(interface)
+    except Exception:
+        pass
+    # Some cameras answer discovery with broadcast ACK frames.
+    try:
+        flags = int(getattr(Aravis.GvInterfaceFlags, "ACK", 0))
+        if flags:
+            Aravis.set_interface_flags("GigEVision", flags)
+    except Exception:
+        pass
 
 
 def downsample_mono(raw: bytes, width: int, height: int, max_w: int, max_h: int) -> tuple[int, int, bytes]:
@@ -839,10 +950,16 @@ class CameraWorker(threading.Thread):
             gi.require_version("Aravis", "0.8")
             from gi.repository import Aravis  # type: ignore
 
-            Aravis.GvInterface.set_discovery_interface_name(self.interface)
-            camera = Aravis.Camera.new(self.camera_ip)
+            configure_aravis_gige_interface(Aravis, self.interface)
+            try:
+                Aravis.update_device_list()
+            except Exception:
+                pass
+            camera, open_note = open_camera_with_fallback(Aravis, self.camera_ip, self.interface)
             if camera is None:
-                raise RuntimeError(f"Camera not found at {self.camera_ip}")
+                raise RuntimeError(f"Camera not found at {self.camera_ip}: {open_note}")
+            if open_note:
+                self._emit("status", f"Connect note: {open_note}")
             self._try_take_control(camera)
 
             camera.gv_set_stream_options(Aravis.GvStreamOption.PACKET_SOCKET_DISABLED)
@@ -854,7 +971,7 @@ class CameraWorker(threading.Thread):
             if stream is None:
                 raise RuntimeError("Failed to create stream")
 
-            if_ip = get_interface_ipv4(self.interface)
+            if_ip = get_interface_ipv4_for_peer(self.interface, self.camera_ip)
             if if_ip:
                 try:
                     if hasattr(stream, "get_port"):
@@ -1052,9 +1169,49 @@ class BaumerLiveApp(tk.Tk):
         self.active_session_profile: CaptureProfile | None = None
         self.session_remaining_frames = 0
         self.session_next_frame_index = 1
+        self.calibration_step_var = tk.StringVar(value="Stage: idle")
+        self.calibration_hint_var = tk.StringVar(value="Press 'Calibrate Camera' to start.")
+        self.calibration_status_var = tk.StringVar(value="Not started")
+        self.calibration_active = False
+        self.calibration_stage = 0
+        self.calibration_cell_size_raw = 120.0
+        self.calibration_size_var = tk.DoubleVar(value=self.calibration_cell_size_raw)
+        self.calibration_origin_x_raw = 0.0
+        self.calibration_origin_y_raw = 0.0
+        self.calibration_grid_initialized = False
+        self.calibration_drag_active = False
+        self.calibration_drag_start_canvas = (0.0, 0.0)
+        self.calibration_drag_start_origin = (0.0, 0.0)
+        self._display_image_rect: tuple[float, float, float, float] | None = None
+        self._display_raw_size = (0, 0)
+        self.calibration_session_dir: Path | None = None
+        self.dark_capture_active = False
+        self.flat_capture_active = False
+        self.calibration_capture_target_frames = 0
+        self.calibration_capture_count_var = tk.StringVar(value="4")
+        self.dark_capture_frames: list["np.ndarray"] = []
+        self.dark_capture_frame_meta: list[dict[str, object]] = []
+        self.flat_capture_frames: list["np.ndarray"] = []
+        self.flat_capture_frame_meta: list[dict[str, object]] = []
+        self.dark_map_mem: "np.ndarray | None" = None
+        self.noise_map_mem: "np.ndarray | None" = None
+        self.flat_raw_mean_mem: "np.ndarray | None" = None
+        self.flat_norm_mem: "np.ndarray | None" = None
+        self.crop_stage1_payload: dict[str, object] | None = None
+        self.geometry_capture_target_frames = 10
+        self.geometry_captured_frames: list["np.ndarray"] = []
+        self.geometry_captured_meta: list[dict[str, object]] = []
+        self.geometry_processing_active = False
+        self.geometry_progress_var = tk.DoubleVar(value=0.0)
+        self.geometry_progress_text_var = tk.StringVar(value="")
+        self.geometry_capture_btn_var = tk.StringVar(value="Capture chess frame 1/10")
+        self.geometry_board_cols_var = tk.StringVar(value="9")
+        self.geometry_board_rows_var = tk.StringVar(value="6")
 
         self._build_ui()
+        self._set_calibration_stage_ui(0)
         self._on_profile_change(None)  # initialize frame count from selected profile
+        self.bind("<Key-c>", lambda _event: self._start_calibration_mode())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(self.ui_poll_ms, self._poll_events)
 
@@ -1081,9 +1238,107 @@ class BaumerLiveApp(tk.Tk):
         ttk.Button(top, text="Refresh Controls", command=self._refresh_controls).grid(row=0, column=6, padx=4)
         ttk.Button(top, text="Snapshot RAW", command=self._snapshot_scientific).grid(row=0, column=7, padx=4)
         ttk.Button(top, text="Auto Find/Fix", command=self._auto_find_fix).grid(row=0, column=8, padx=4)
+        ttk.Button(top, text="Calibrate Camera", command=self._start_calibration_mode).grid(row=0, column=9, padx=4)
 
-        preview_frame = ttk.LabelFrame(root, text="Live")
-        preview_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        center_area = ttk.Frame(root)
+        center_area.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        center_area.rowconfigure(0, weight=1)
+        center_area.columnconfigure(0, weight=0)
+        center_area.columnconfigure(1, weight=1)
+
+        self.calibration_panel = ttk.LabelFrame(center_area, text="Calibration")
+        self.calibration_panel.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        self.calibration_panel.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            self.calibration_panel,
+            textvariable=self.calibration_step_var,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(10, 6))
+        ttk.Label(
+            self.calibration_panel,
+            textvariable=self.calibration_hint_var,
+            justify="left",
+            wraplength=220,
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(
+            self.calibration_panel,
+            textvariable=self.calibration_status_var,
+            wraplength=220,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(self.calibration_panel, text="Grid cell side (raw px)").grid(row=3, column=0, sticky="w", padx=8)
+        self.calibration_size_scale = ttk.Scale(
+            self.calibration_panel,
+            from_=16,
+            to=512,
+            variable=self.calibration_size_var,
+            orient=tk.HORIZONTAL,
+            length=220,
+            command=self._on_calibration_size_slide,
+        )
+        self.calibration_size_scale.grid(row=4, column=0, padx=8, pady=(2, 8), sticky="ew")
+        self.calibration_burst_row = ttk.Frame(self.calibration_panel)
+        self.calibration_burst_row.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Label(self.calibration_burst_row, text="Burst frames").grid(row=0, column=0, sticky="w")
+        self.calibration_burst_entry = ttk.Entry(
+            self.calibration_burst_row, textvariable=self.calibration_capture_count_var, width=8
+        )
+        self.calibration_burst_entry.grid(row=0, column=1, padx=(8, 0), sticky="w")
+        self.geometry_pattern_row = ttk.Frame(self.calibration_panel)
+        self.geometry_pattern_row.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Label(self.geometry_pattern_row, text="Chessboard").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.geometry_pattern_row, text="cols").grid(row=0, column=1, sticky="w", padx=(8, 2))
+        self.geometry_cols_entry = ttk.Entry(self.geometry_pattern_row, textvariable=self.geometry_board_cols_var, width=4)
+        self.geometry_cols_entry.grid(row=0, column=2, sticky="w")
+        ttk.Label(self.geometry_pattern_row, text="rows").grid(row=0, column=3, sticky="w", padx=(8, 2))
+        self.geometry_rows_entry = ttk.Entry(self.geometry_pattern_row, textvariable=self.geometry_board_rows_var, width=4)
+        self.geometry_rows_entry.grid(row=0, column=4, sticky="w")
+
+        self.calib_btn_row = ttk.Frame(self.calibration_panel)
+        self.calib_btn_row.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 10))
+        self.calib_save_stage1_btn = ttk.Button(
+            self.calib_btn_row,
+            text="Save Stage 1",
+            command=self._complete_calibration_stage1,
+        )
+        self.calib_dark_btn = ttk.Button(
+            self.calib_btn_row,
+            text="Create Dark Map",
+            command=self._start_dark_map_capture,
+        )
+        self.calib_flat_btn = ttk.Button(
+            self.calib_btn_row,
+            text="Create Flat Map",
+            command=self._start_flat_map_capture,
+        )
+        self.calib_geometry_btn = ttk.Button(
+            self.calib_btn_row,
+            textvariable=self.geometry_capture_btn_var,
+            command=self._capture_geometry_frame,
+        )
+        self.calib_cancel_btn = ttk.Button(self.calib_btn_row, text="Cancel", command=self._cancel_calibration_mode)
+
+        self.geometry_progress_row = ttk.Frame(self.calibration_panel)
+        self.geometry_progress_row.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 10))
+        self.geometry_progress = ttk.Progressbar(
+            self.geometry_progress_row,
+            orient=tk.HORIZONTAL,
+            mode="determinate",
+            maximum=100.0,
+            variable=self.geometry_progress_var,
+            length=220,
+        )
+        self.geometry_progress.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            self.geometry_progress_row,
+            textvariable=self.geometry_progress_text_var,
+            wraplength=220,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        preview_frame = ttk.LabelFrame(center_area, text="Live")
+        preview_frame.grid(row=0, column=1, sticky="nsew")
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
 
@@ -1091,6 +1346,9 @@ class BaumerLiveApp(tk.Tk):
         self.preview_canvas.grid(row=0, column=0, sticky="nsew")
         self.preview_canvas.bind("<Configure>", self._on_canvas_resize)
         self.preview_canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.preview_canvas.bind("<ButtonPress-1>", self._on_canvas_button_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_button_release)
         self.canvas_image_id = self.preview_canvas.create_image(0, 0, anchor="center")
         self.canvas_text_id = self.preview_canvas.create_text(
             0,
@@ -1101,7 +1359,7 @@ class BaumerLiveApp(tk.Tk):
         )
 
         right_panel = ttk.Frame(root)
-        right_panel.grid(row=1, column=1, sticky="ns")
+        right_panel.grid(row=1, column=1, sticky="nsew")
         right_panel.rowconfigure(0, weight=1)
         right_panel.columnconfigure(0, weight=1)
 
@@ -1239,6 +1497,8 @@ class BaumerLiveApp(tk.Tk):
         cap_btn_row.grid(row=28, column=0, sticky="ew", padx=8, pady=(0, 8))
         ttk.Button(cap_btn_row, text="Capture Session", command=self._start_session_capture).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(cap_btn_row, text="Stop", command=self._stop_session_capture).grid(row=0, column=1)
+
+        self._set_calibration_panel_visible(False)
 
     def _on_right_canvas_configure(self, event: tk.Event) -> None:
         try:
@@ -1774,6 +2034,1111 @@ class BaumerLiveApp(tk.Tk):
         # Snapshot action now routes to scientific RAW session branch.
         self._snapshot_scientific()
 
+    def _set_calibration_panel_visible(self, visible: bool) -> None:
+        if not hasattr(self, "calibration_panel"):
+            return
+        if visible:
+            self.calibration_panel.grid()
+        else:
+            self.calibration_panel.grid_remove()
+
+    def _set_calibration_stage_ui(self, stage: int) -> None:
+        self.calib_save_stage1_btn.grid_remove()
+        self.calib_dark_btn.grid_remove()
+        self.calib_flat_btn.grid_remove()
+        self.calib_geometry_btn.grid_remove()
+        self.calib_cancel_btn.grid_remove()
+        self.calibration_burst_row.grid_remove()
+        self.geometry_pattern_row.grid_remove()
+        self.geometry_progress_row.grid_remove()
+        self.geometry_cols_entry.state(["disabled"])
+        self.geometry_rows_entry.state(["disabled"])
+        if stage == 1:
+            self.calibration_step_var.set("Stage 1/5: Crop Grid")
+            self.calibration_hint_var.set(
+                "Align 4x4 square grid before demosaic.\nDrag grid on preview and adjust cell side."
+            )
+            self.calibration_size_scale.state(["!disabled"])
+            self.calibration_burst_entry.state(["disabled"])
+            self.calib_save_stage1_btn.state(["!disabled"])
+            self.calib_save_stage1_btn.grid(row=0, column=0, padx=(0, 6))
+            self.calib_cancel_btn.grid(row=0, column=1)
+        elif stage == 2:
+            self.calibration_step_var.set("Stage 2/5: Dark Calibration")
+            self.calibration_hint_var.set(
+                "Set Gain/Exposure, close lens, then press 'Create Dark Map'.\n"
+                "Burst frame count is configurable below."
+            )
+            self.calibration_size_scale.state(["disabled"])
+            self.calibration_burst_entry.state(["!disabled"])
+            self.calibration_burst_row.grid()
+            self.calib_dark_btn.state(["!disabled"])
+            self.calib_dark_btn.grid(row=0, column=0, padx=(0, 6))
+            self.calib_cancel_btn.grid(row=0, column=1)
+        elif stage == 3:
+            self.calibration_step_var.set("Stage 3/5: Flat-field Calibration")
+            self.calibration_hint_var.set(
+                "Place uniform white target (e.g. Spectralon), keep illumination uniform,\n"
+                "then create Flat Map from configurable burst."
+            )
+            self.calibration_size_scale.state(["disabled"])
+            self.calibration_burst_entry.state(["!disabled"])
+            self.calibration_burst_row.grid()
+            self.calib_flat_btn.state(["!disabled"])
+            self.calib_flat_btn.grid(row=0, column=0, padx=(0, 6))
+            self.calib_cancel_btn.grid(row=0, column=1)
+        elif stage == 4:
+            self.calibration_step_var.set("Stage 4/5: Geometry Calibration")
+            if CV2_AVAILABLE:
+                self.calibration_hint_var.set(
+                    "Place chessboard and capture 10 frames at different distances.\n"
+                    "After frame 10/10, homography estimation starts automatically."
+                )
+            else:
+                self.calibration_hint_var.set(
+                    "OpenCV is not installed, so geometry stage is unavailable.\n"
+                    "Install with: python3.14 -m pip install opencv-python"
+                )
+            self.calibration_size_scale.state(["disabled"])
+            self.calibration_burst_entry.state(["disabled"])
+            self.geometry_pattern_row.grid()
+            if CV2_AVAILABLE:
+                self.geometry_cols_entry.state(["!disabled"])
+                self.geometry_rows_entry.state(["!disabled"])
+            else:
+                self.geometry_cols_entry.state(["disabled"])
+                self.geometry_rows_entry.state(["disabled"])
+            captured = len(self.geometry_captured_frames)
+            next_idx = min(captured + 1, self.geometry_capture_target_frames)
+            self.geometry_capture_btn_var.set(
+                f"Capture chess frame {next_idx}/{self.geometry_capture_target_frames}"
+            )
+            if CV2_AVAILABLE:
+                self.calib_geometry_btn.state(["!disabled"])
+            else:
+                self.calib_geometry_btn.state(["disabled"])
+            self.calib_geometry_btn.grid(row=0, column=0, padx=(0, 6))
+            self.calib_cancel_btn.grid(row=0, column=1)
+            self.geometry_progress_row.grid()
+            if self.geometry_processing_active:
+                self.calib_geometry_btn.state(["disabled"])
+                self.geometry_cols_entry.state(["disabled"])
+                self.geometry_rows_entry.state(["disabled"])
+                self.geometry_progress_text_var.set("Geometry solve in progress...")
+            else:
+                if self.geometry_progress_var.get() <= 0.0:
+                    if CV2_AVAILABLE:
+                        self.geometry_progress_text_var.set("")
+                    else:
+                        self.geometry_progress_text_var.set("Install opencv-python to enable this stage.")
+        elif stage == 5:
+            self.calibration_step_var.set("Stage 5/5: Not Implemented")
+            self.calibration_hint_var.set("Geometry calibration completed. Stage 5 is not implemented yet.")
+            self.calibration_size_scale.state(["disabled"])
+            self.calibration_burst_entry.state(["disabled"])
+            self.geometry_pattern_row.grid()
+            self.geometry_cols_entry.state(["disabled"])
+            self.geometry_rows_entry.state(["disabled"])
+            self.geometry_progress_row.grid()
+            self.calib_cancel_btn.grid(row=0, column=0)
+        else:
+            self.calibration_step_var.set("Stage: idle")
+            self.calibration_hint_var.set("Press 'Calibrate Camera' to start.")
+            self.calibration_size_scale.state(["disabled"])
+            self.calibration_burst_entry.state(["disabled"])
+            self.calib_cancel_btn.state(["!disabled"])
+
+    def _start_calibration_mode(self) -> None:
+        if self.last_frame is None:
+            self.status_var.set("Calibration requires a live frame")
+            return
+        self.calibration_active = True
+        self.calibration_stage = 1
+        self.calibration_session_dir = None
+        self.dark_capture_active = False
+        self.flat_capture_active = False
+        self.dark_capture_frames = []
+        self.dark_capture_frame_meta = []
+        self.flat_capture_frames = []
+        self.flat_capture_frame_meta = []
+        self.calibration_capture_target_frames = 0
+        self.dark_map_mem = None
+        self.noise_map_mem = None
+        self.flat_raw_mean_mem = None
+        self.flat_norm_mem = None
+        self.crop_stage1_payload = None
+        self.geometry_captured_frames = []
+        self.geometry_captured_meta = []
+        self.geometry_processing_active = False
+        self.geometry_progress_var.set(0.0)
+        self.geometry_progress_text_var.set("")
+        self.geometry_capture_btn_var.set(
+            f"Capture chess frame 1/{self.geometry_capture_target_frames}"
+        )
+        self._set_calibration_panel_visible(True)
+        self._set_calibration_stage_ui(1)
+        self.calibration_status_var.set(
+            "Stage 1: adjust 4x4 square grid (drag on preview + size slider), then Save Stage 1."
+        )
+        self._ensure_calibration_grid_for_frame(self.last_frame, reset=True)
+        self._rerender_latest()
+
+    def _cancel_calibration_mode(self) -> None:
+        self.calibration_active = False
+        self.calibration_stage = 0
+        self.calibration_drag_active = False
+        self.dark_capture_active = False
+        self.flat_capture_active = False
+        self.dark_capture_frames = []
+        self.dark_capture_frame_meta = []
+        self.flat_capture_frames = []
+        self.flat_capture_frame_meta = []
+        self.calibration_capture_target_frames = 0
+        self.geometry_captured_frames = []
+        self.geometry_captured_meta = []
+        self.geometry_processing_active = False
+        self.geometry_progress_var.set(0.0)
+        self.geometry_progress_text_var.set("")
+        self.geometry_capture_btn_var.set(
+            f"Capture chess frame 1/{self.geometry_capture_target_frames}"
+        )
+        self.calibration_session_dir = None
+        self._set_calibration_panel_visible(False)
+        self._set_calibration_stage_ui(0)
+        self.calibration_status_var.set("Calibration cancelled")
+        self.preview_canvas.delete("calib_overlay")
+
+    def _on_calibration_size_slide(self, _value: str) -> None:
+        if not self.calibration_active or self.calibration_stage != 1 or self.last_frame is None:
+            return
+        self.calibration_cell_size_raw = float(self.calibration_size_var.get())
+        self._clamp_calibration_grid(self.last_frame.width, self.last_frame.height)
+        self._draw_calibration_overlay()
+
+    def _parse_calibration_burst_count(self) -> int | None:
+        raw = self.calibration_capture_count_var.get().strip()
+        if not raw:
+            self.status_var.set("Burst frames value is empty")
+            return None
+        try:
+            count = int(raw)
+        except ValueError:
+            self.status_var.set(f"Invalid burst frames value: {raw}")
+            return None
+        if count < 1 or count > 256:
+            self.status_var.set("Burst frames must be in range 1..256")
+            return None
+        self.calibration_capture_count_var.set(str(count))
+        return count
+
+    def _low_pass_flat_field(self, image: "np.ndarray") -> "np.ndarray":
+        arr = image.astype(np.float32, copy=False)
+        if gaussian_filter is not None:
+            return gaussian_filter(arr, sigma=3.0)
+        if convolve is not None:
+            kernel = np.ones((7, 7), dtype=np.float32) / 49.0
+            return convolve(arr, kernel, mode="mirror")
+        return arr
+
+    def _ensure_calibration_grid_for_frame(self, frame: FramePacket, reset: bool = False) -> None:
+        if frame.width <= 0 or frame.height <= 0:
+            return
+        max_side = max(16, min(frame.width, frame.height) // 4)
+        self.calibration_size_scale.configure(from_=16, to=max_side)
+        if reset or not self.calibration_grid_initialized:
+            side = min(max_side, max(16, int(round(float(self.calibration_size_var.get())))))
+            self.calibration_cell_size_raw = float(side)
+            self.calibration_size_var.set(float(side))
+            total = 4.0 * self.calibration_cell_size_raw
+            self.calibration_origin_x_raw = max(0.0, (frame.width - total) * 0.5)
+            self.calibration_origin_y_raw = max(0.0, (frame.height - total) * 0.5)
+            self.calibration_grid_initialized = True
+        self._clamp_calibration_grid(frame.width, frame.height)
+
+    def _clamp_calibration_grid(self, frame_w: int, frame_h: int) -> None:
+        if frame_w <= 0 or frame_h <= 0:
+            return
+        max_side = max(16.0, float(min(frame_w, frame_h) // 4))
+        self.calibration_cell_size_raw = max(16.0, min(max_side, float(self.calibration_cell_size_raw)))
+        self.calibration_size_var.set(self.calibration_cell_size_raw)
+        total = 4.0 * self.calibration_cell_size_raw
+        self.calibration_origin_x_raw = max(0.0, min(float(frame_w) - total, float(self.calibration_origin_x_raw)))
+        self.calibration_origin_y_raw = max(0.0, min(float(frame_h) - total, float(self.calibration_origin_y_raw)))
+
+    def _grid_contains_canvas_point(self, x: float, y: float) -> bool:
+        if self._display_image_rect is None:
+            return False
+        disp_x, disp_y, disp_w, disp_h = self._display_image_rect
+        raw_w, raw_h = self._display_raw_size
+        if disp_w <= 0 or disp_h <= 0 or raw_w <= 0 or raw_h <= 0:
+            return False
+        scale_x = disp_w / float(raw_w)
+        scale_y = disp_h / float(raw_h)
+        gx0 = disp_x + self.calibration_origin_x_raw * scale_x
+        gy0 = disp_y + self.calibration_origin_y_raw * scale_y
+        gsize_x = self.calibration_cell_size_raw * 4.0 * scale_x
+        gsize_y = self.calibration_cell_size_raw * 4.0 * scale_y
+        return gx0 <= x <= (gx0 + gsize_x) and gy0 <= y <= (gy0 + gsize_y)
+
+    def _on_canvas_button_press(self, event: tk.Event) -> None:
+        if not self.calibration_active or self.calibration_stage != 1 or self.last_frame is None:
+            return
+        if not self._grid_contains_canvas_point(float(event.x), float(event.y)):
+            return
+        self.calibration_drag_active = True
+        self.calibration_drag_start_canvas = (float(event.x), float(event.y))
+        self.calibration_drag_start_origin = (self.calibration_origin_x_raw, self.calibration_origin_y_raw)
+
+    def _on_canvas_drag(self, event: tk.Event) -> None:
+        if not self.calibration_drag_active or self.last_frame is None or self._display_image_rect is None:
+            return
+        disp_x, disp_y, disp_w, disp_h = self._display_image_rect
+        raw_w, raw_h = self._display_raw_size
+        if disp_w <= 0 or disp_h <= 0 or raw_w <= 0 or raw_h <= 0:
+            return
+        dx_canvas = float(event.x) - self.calibration_drag_start_canvas[0]
+        dy_canvas = float(event.y) - self.calibration_drag_start_canvas[1]
+        dx_raw = dx_canvas * float(raw_w) / float(disp_w)
+        dy_raw = dy_canvas * float(raw_h) / float(disp_h)
+        self.calibration_origin_x_raw = self.calibration_drag_start_origin[0] + dx_raw
+        self.calibration_origin_y_raw = self.calibration_drag_start_origin[1] + dy_raw
+        self._clamp_calibration_grid(self.last_frame.width, self.last_frame.height)
+        self._draw_calibration_overlay()
+
+    def _on_canvas_button_release(self, _event: tk.Event) -> None:
+        self.calibration_drag_active = False
+
+    def _draw_calibration_overlay(self) -> None:
+        self.preview_canvas.delete("calib_overlay")
+        if (
+            not self.calibration_active
+            or self.calibration_stage != 1
+            or self._display_image_rect is None
+            or self.last_frame is None
+        ):
+            return
+        disp_x, disp_y, disp_w, disp_h = self._display_image_rect
+        raw_w, raw_h = self._display_raw_size
+        if disp_w <= 0 or disp_h <= 0 or raw_w <= 0 or raw_h <= 0:
+            return
+
+        self._ensure_calibration_grid_for_frame(self.last_frame, reset=False)
+
+        scale_x = disp_w / float(raw_w)
+        scale_y = disp_h / float(raw_h)
+        gx0 = disp_x + self.calibration_origin_x_raw * scale_x
+        gy0 = disp_y + self.calibration_origin_y_raw * scale_y
+        cell_w = self.calibration_cell_size_raw * scale_x
+        cell_h = self.calibration_cell_size_raw * scale_y
+        g_w = cell_w * 4.0
+        g_h = cell_h * 4.0
+
+        self.preview_canvas.create_rectangle(
+            gx0,
+            gy0,
+            gx0 + g_w,
+            gy0 + g_h,
+            outline="#00ff88",
+            width=2,
+            tags="calib_overlay",
+        )
+        for i in range(1, 4):
+            x = gx0 + i * cell_w
+            y = gy0 + i * cell_h
+            self.preview_canvas.create_line(x, gy0, x, gy0 + g_h, fill="#00ff88", width=1, tags="calib_overlay")
+            self.preview_canvas.create_line(gx0, y, gx0 + g_w, y, fill="#00ff88", width=1, tags="calib_overlay")
+
+        idx = 0
+        for row in range(4):
+            for col in range(4):
+                cx = gx0 + (col + 0.5) * cell_w
+                cy = gy0 + (row + 0.5) * cell_h
+                self.preview_canvas.create_text(
+                    cx,
+                    cy,
+                    text=str(idx),
+                    fill="#00ff88",
+                    font=("Helvetica", 10, "bold"),
+                    tags="calib_overlay",
+                )
+                idx += 1
+
+    def _build_stage1_crop_payload(self, frame: FramePacket) -> dict[str, object]:
+        self._ensure_calibration_grid_for_frame(frame, reset=False)
+        side = int(round(self.calibration_cell_size_raw))
+        ox = int(round(self.calibration_origin_x_raw))
+        oy = int(round(self.calibration_origin_y_raw))
+        zones: list[dict[str, int]] = []
+        idx = 0
+        for row in range(4):
+            for col in range(4):
+                x = ox + col * side
+                y = oy + row * side
+                zones.append(
+                    {
+                        "index": idx,
+                        "row": row,
+                        "col": col,
+                        "x": x,
+                        "y": y,
+                        "width": side,
+                        "height": side,
+                    }
+                )
+                idx += 1
+        return {
+            "stage": "stage_1_crop_grid",
+            "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "before_demosaic": True,
+            "image_width": int(frame.width),
+            "image_height": int(frame.height),
+            "grid": {
+                "rows": 4,
+                "cols": 4,
+                "origin_x": ox,
+                "origin_y": oy,
+                "cell_size": side,
+                "total_size": side * 4,
+            },
+            "zones": zones,
+            "next_stage": "dark_calibration",
+        }
+
+    def _ensure_calibration_root_dir(self) -> Path:
+        if self.active_session_writer is not None:
+            root_dir = self.active_session_writer.root_dir
+            self.calibration_session_dir = root_dir
+            return root_dir
+        if self.calibration_session_dir is not None and self.calibration_session_dir.exists():
+            return self.calibration_session_dir
+        base_raw = self.session_dir_var.get().strip()
+        base_dir = Path(base_raw).expanduser() if base_raw else self.snapshot_dir
+        ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        root_dir = base_dir / f"session_{ts}_calibration"
+        root_dir.mkdir(parents=True, exist_ok=True)
+        self.calibration_session_dir = root_dir
+        return root_dir
+
+    def _update_calibration_session_json(self, updates: dict[str, object]) -> None:
+        root_dir = self._ensure_calibration_root_dir()
+        session_json = root_dir / "session.json"
+        try:
+            if session_json.exists():
+                data = json.loads(session_json.read_text(encoding="utf-8"))
+            else:
+                data = {
+                    "session_start_timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "notes": "calibration-only session",
+                }
+            calibration = data.get("calibration")
+            if not isinstance(calibration, dict):
+                calibration = {}
+            calibration.update(updates)
+            data["calibration"] = calibration
+            session_json.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            self.status_var.set(f"Calibration metadata warning: {exc}")
+
+    def _save_stage1_crop_payload(self, payload: dict[str, object]) -> Path:
+        root_dir = self._ensure_calibration_root_dir()
+
+        crop_path = root_dir / "crop.json"
+        crop_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.crop_stage1_payload = dict(payload)
+        self._update_calibration_session_json(
+            {
+                "stage_1_crop_file": "crop.json",
+                "stage_1_status": "completed",
+                "next_stage": "dark_calibration",
+            }
+        )
+        return crop_path
+
+    def _start_dark_map_capture(self) -> None:
+        if self.calibration_stage != 2 or not self.calibration_active:
+            self.status_var.set("Dark calibration is available only in calibration stage 2")
+            return
+        if self.dark_capture_active or self.flat_capture_active:
+            self.status_var.set("Calibration burst is already running")
+            return
+        if self.active_session_writer is not None:
+            self.status_var.set("Stop active capture session before dark calibration")
+            return
+        if not (self.worker and self.worker.is_alive()):
+            self.status_var.set("Connect camera first")
+            return
+        if np is None or decode_buffer_to_ndarray is None:
+            self.status_var.set("Dark calibration requires scientific decode modules")
+            return
+        count = self._parse_calibration_burst_count()
+        if count is None:
+            return
+        self.calibration_capture_target_frames = count
+        self.dark_capture_active = True
+        self.flat_capture_active = False
+        self.dark_capture_frames = []
+        self.dark_capture_frame_meta = []
+        self.flat_capture_frames = []
+        self.flat_capture_frame_meta = []
+        self.calib_dark_btn.state(["disabled"])
+        self.calib_flat_btn.state(["disabled"])
+        self.calibration_status_var.set(
+            f"Stage 2: capturing dark burst ({self.calibration_capture_target_frames} frames)..."
+        )
+        self.status_var.set(
+            "Dark capture started. Keep lens closed and scene stable until burst is complete."
+        )
+
+    def _consume_dark_capture_frame(self, frame: FramePacket) -> None:
+        if not self.dark_capture_active or decode_buffer_to_ndarray is None or np is None:
+            return
+        meta = dict(frame.meta or {})
+        if "pixel_format_name" not in meta:
+            if self.camera_info.get("pixel_format"):
+                meta["pixel_format_name"] = str(self.camera_info.get("pixel_format"))
+            elif pixel_format_to_name is not None:
+                meta["pixel_format_name"] = pixel_format_to_name(frame.pixel_format)
+        pixel_format = meta.get("pixel_format_name", frame.pixel_format)
+        try:
+            # RAW decode keeps Bayer/Mono mosaic data untouched (no debayer).
+            raw_arr = decode_buffer_to_ndarray(frame.raw, frame.width, frame.height, pixel_format)
+        except Exception as exc:
+            self.dark_capture_active = False
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set(f"Dark capture failed (decode): {exc}")
+            return
+        if raw_arr.ndim != 2:
+            self.dark_capture_active = False
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set("Dark capture expects 2D raw frames")
+            return
+        raw_f32 = raw_arr.astype(np.float32, copy=False)
+        if self.dark_capture_frames:
+            ref = self.dark_capture_frames[0]
+            if raw_f32.shape != ref.shape:
+                self.dark_capture_active = False
+                self._set_calibration_stage_ui(self.calibration_stage)
+                self.status_var.set("Dark capture failed: frame shape changed during burst")
+                return
+        self.dark_capture_frames.append(raw_f32.copy())
+        self.dark_capture_frame_meta.append(meta)
+
+        n = len(self.dark_capture_frames)
+        self.calibration_status_var.set(
+            f"Stage 2: captured {n}/{self.calibration_capture_target_frames} dark frames..."
+        )
+        if n < self.calibration_capture_target_frames:
+            return
+
+        self.dark_capture_active = False
+        stack = np.stack(self.dark_capture_frames, axis=0)
+        dark_map = np.mean(stack, axis=0, dtype=np.float64).astype(np.float32)
+        noise_map = np.std(stack, axis=0, dtype=np.float64).astype(np.float32)
+        self.dark_map_mem = dark_map
+        self.noise_map_mem = noise_map
+
+        root_dir = self._ensure_calibration_root_dir()
+        dark_map_path = root_dir / "dark_map.npy"
+        noise_map_path = root_dir / "noise_map.npy"
+        burst_path = root_dir / "dark_frames.npy"
+        json_path = root_dir / "dark_calibration.json"
+        np.save(dark_map_path, dark_map)
+        np.save(noise_map_path, noise_map)
+        np.save(burst_path, stack.astype(np.float32))
+
+        latest_meta = self.dark_capture_frame_meta[-1] if self.dark_capture_frame_meta else {}
+        info = {
+            "stage": "stage_2_dark_calibration",
+            "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "frames_count": int(stack.shape[0]),
+            "height": int(stack.shape[1]),
+            "width": int(stack.shape[2]),
+            "pixel_format": latest_meta.get("pixel_format_name", latest_meta.get("pixel_format_int")),
+            "gain_db": float(self.gain_var.get()),
+            "exposure_us": float(self.exposure_var.get()),
+            "dark_map_formula": "dark_map(x,y)=mean(dark_frames)",
+            "noise_map_formula": "noise_map(x,y)=std(dark_frames)",
+            "apply_formula": "I1(x,y,z)=I_raw(x,y,z)-dark_map(x,y,z)",
+            "processing_domain": "raw_before_demosaic",
+            "files": {
+                "dark_map": dark_map_path.name,
+                "noise_map": noise_map_path.name,
+                "dark_frames": burst_path.name,
+            },
+        }
+        json_path.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._update_calibration_session_json(
+            {
+                "stage_2_status": "completed",
+                "stage_2_dark_map_file": dark_map_path.name,
+                "stage_2_noise_map_file": noise_map_path.name,
+                "stage_2_burst_file": burst_path.name,
+                "stage_2_metadata_file": json_path.name,
+                "next_stage": "flat_field_calibration",
+            }
+        )
+        self.calibration_stage = 3
+        self._set_calibration_stage_ui(3)
+        self.dark_capture_frames = []
+        self.dark_capture_frame_meta = []
+        self.calibration_status_var.set("Stage 2 complete: dark_map/noise_map saved in RAM and on disk.")
+        self.status_var.set(f"Dark calibration done: {root_dir}")
+
+    def _start_flat_map_capture(self) -> None:
+        if self.calibration_stage != 3 or not self.calibration_active:
+            self.status_var.set("Flat-field calibration is available only in calibration stage 3")
+            return
+        if self.dark_capture_active or self.flat_capture_active:
+            self.status_var.set("Calibration burst is already running")
+            return
+        if self.active_session_writer is not None:
+            self.status_var.set("Stop active capture session before flat calibration")
+            return
+        if not (self.worker and self.worker.is_alive()):
+            self.status_var.set("Connect camera first")
+            return
+        if np is None or decode_buffer_to_ndarray is None:
+            self.status_var.set("Flat calibration requires scientific decode modules")
+            return
+        if self.dark_map_mem is None:
+            self.status_var.set("Dark map is missing in RAM. Complete Stage 2 first.")
+            return
+        count = self._parse_calibration_burst_count()
+        if count is None:
+            return
+        self.calibration_capture_target_frames = count
+        self.flat_capture_active = True
+        self.dark_capture_active = False
+        self.flat_capture_frames = []
+        self.flat_capture_frame_meta = []
+        self.calib_flat_btn.state(["disabled"])
+        self.calib_dark_btn.state(["disabled"])
+        self.calibration_status_var.set(
+            f"Stage 3: capturing flat burst ({self.calibration_capture_target_frames} frames)..."
+        )
+        self.status_var.set("Flat capture started. Keep white target and illumination stable.")
+
+    def _consume_flat_capture_frame(self, frame: FramePacket) -> None:
+        if not self.flat_capture_active or decode_buffer_to_ndarray is None or np is None:
+            return
+        if self.dark_map_mem is None:
+            self.flat_capture_active = False
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set("Flat capture failed: dark map not present in RAM")
+            return
+
+        meta = dict(frame.meta or {})
+        if "pixel_format_name" not in meta:
+            if self.camera_info.get("pixel_format"):
+                meta["pixel_format_name"] = str(self.camera_info.get("pixel_format"))
+            elif pixel_format_to_name is not None:
+                meta["pixel_format_name"] = pixel_format_to_name(frame.pixel_format)
+        pixel_format = meta.get("pixel_format_name", frame.pixel_format)
+        try:
+            # RAW decode keeps Bayer/Mono mosaic data untouched (no debayer).
+            raw_arr = decode_buffer_to_ndarray(frame.raw, frame.width, frame.height, pixel_format)
+        except Exception as exc:
+            self.flat_capture_active = False
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set(f"Flat capture failed (decode): {exc}")
+            return
+        if raw_arr.ndim != 2:
+            self.flat_capture_active = False
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set("Flat capture expects 2D raw frames")
+            return
+
+        raw_f32 = raw_arr.astype(np.float32, copy=False)
+        dark_map = self.dark_map_mem
+        if raw_f32.shape != dark_map.shape:
+            self.flat_capture_active = False
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set("Flat capture failed: dark map shape mismatch")
+            return
+
+        corrected = raw_f32 - dark_map
+        self.flat_capture_frames.append(corrected.copy())
+        self.flat_capture_frame_meta.append(meta)
+
+        n = len(self.flat_capture_frames)
+        self.calibration_status_var.set(
+            f"Stage 3: captured {n}/{self.calibration_capture_target_frames} flat frames..."
+        )
+        if n < self.calibration_capture_target_frames:
+            return
+
+        self.flat_capture_active = False
+        stack = np.stack(self.flat_capture_frames, axis=0)
+        flat_raw_mean = np.mean(stack, axis=0, dtype=np.float64).astype(np.float32)
+        flat_smooth = self._low_pass_flat_field(flat_raw_mean).astype(np.float32)
+        mean_flat = float(np.mean(flat_smooth, dtype=np.float64))
+        if abs(mean_flat) < 1e-9:
+            self._set_calibration_stage_ui(self.calibration_stage)
+            self.status_var.set("Flat calibration failed: mean(flat) is near zero")
+            return
+        flat_norm = flat_smooth / mean_flat
+        flat_norm = np.where(np.abs(flat_norm) < 1e-6, 1e-6, flat_norm).astype(np.float32)
+        self.flat_raw_mean_mem = flat_raw_mean
+        self.flat_norm_mem = flat_norm
+
+        root_dir = self._ensure_calibration_root_dir()
+        flat_mean_path = root_dir / "flat_raw_mean.npy"
+        flat_smooth_path = root_dir / "flat_smooth.npy"
+        flat_norm_path = root_dir / "flat_norm.npy"
+        burst_path = root_dir / "flat_frames_minus_dark.npy"
+        json_path = root_dir / "flat_calibration.json"
+        np.save(flat_mean_path, flat_raw_mean)
+        np.save(flat_smooth_path, flat_smooth)
+        np.save(flat_norm_path, flat_norm)
+        np.save(burst_path, stack.astype(np.float32))
+
+        latest_meta = self.flat_capture_frame_meta[-1] if self.flat_capture_frame_meta else {}
+        info = {
+            "stage": "stage_3_flat_field_calibration",
+            "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "frames_count": int(stack.shape[0]),
+            "height": int(stack.shape[1]),
+            "width": int(stack.shape[2]),
+            "pixel_format": latest_meta.get("pixel_format_name", latest_meta.get("pixel_format_int")),
+            "gain_db": float(self.gain_var.get()),
+            "exposure_us": float(self.exposure_var.get()),
+            "flat_formula": "F(x,y)=mean(flat_frames-dark_map)",
+            "flat_norm_formula": "flat_norm(x,y)=F(x,y)/mean(F)",
+            "apply_formula": "I2(x,y)=(I_raw-dark_map)/flat_norm",
+            "processing_domain": "raw_before_demosaic",
+            "low_pass_filter": "gaussian sigma=3.0" if gaussian_filter is not None else "box 7x7",
+            "files": {
+                "flat_raw_mean": flat_mean_path.name,
+                "flat_smooth": flat_smooth_path.name,
+                "flat_norm": flat_norm_path.name,
+                "flat_frames_minus_dark": burst_path.name,
+            },
+        }
+        json_path.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._update_calibration_session_json(
+            {
+                "stage_3_status": "completed",
+                "stage_3_flat_raw_mean_file": flat_mean_path.name,
+                "stage_3_flat_smooth_file": flat_smooth_path.name,
+                "stage_3_flat_norm_file": flat_norm_path.name,
+                "stage_3_burst_file": burst_path.name,
+                "stage_3_metadata_file": json_path.name,
+                "next_stage": "geometry_calibration",
+            }
+        )
+        self.flat_capture_frames = []
+        self.flat_capture_frame_meta = []
+        self.calibration_stage = 4
+        self.geometry_captured_frames = []
+        self.geometry_captured_meta = []
+        self.geometry_progress_var.set(0.0)
+        self.geometry_progress_text_var.set("")
+        self.geometry_capture_btn_var.set(f"Capture chess frame 1/{self.geometry_capture_target_frames}")
+        self._set_calibration_stage_ui(4)
+        self.calibration_status_var.set(
+            "Stage 3 complete: flat-field map saved. Stage 4: capture 10 chessboard frames."
+        )
+        self.status_var.set(f"Flat-field calibration done: {root_dir}")
+
+    def _parse_geometry_pattern(self) -> tuple[int, int] | None:
+        cols_raw = self.geometry_board_cols_var.get().strip()
+        rows_raw = self.geometry_board_rows_var.get().strip()
+        try:
+            cols = int(cols_raw)
+            rows = int(rows_raw)
+        except ValueError:
+            self.status_var.set(f"Invalid chessboard size: cols={cols_raw}, rows={rows_raw}")
+            return None
+        if cols < 3 or rows < 3:
+            self.status_var.set("Chessboard inner corners must be at least 3x3")
+            return None
+        return cols, rows
+
+    def _get_stage1_zones(self) -> list[dict[str, int]] | None:
+        payload = self.crop_stage1_payload
+        if payload is None:
+            root = self.calibration_session_dir
+            if root is not None:
+                crop_json = root / "crop.json"
+                if crop_json.exists():
+                    try:
+                        payload = json.loads(crop_json.read_text(encoding="utf-8"))
+                        self.crop_stage1_payload = payload
+                    except Exception:
+                        payload = None
+        if not isinstance(payload, dict):
+            return None
+        zones_raw = payload.get("zones")
+        if not isinstance(zones_raw, list) or len(zones_raw) != 16:
+            return None
+        zones: list[dict[str, int]] = []
+        for item in zones_raw:
+            if not isinstance(item, dict):
+                return None
+            try:
+                zones.append(
+                    {
+                        "index": int(item["index"]),
+                        "row": int(item["row"]),
+                        "col": int(item["col"]),
+                        "x": int(item["x"]),
+                        "y": int(item["y"]),
+                        "width": int(item["width"]),
+                        "height": int(item["height"]),
+                    }
+                )
+            except Exception:
+                return None
+        zones.sort(key=lambda z: z["index"])
+        return zones
+
+    def _detect_geometry_corners_on_zones(
+        self,
+        frame: "np.ndarray",
+        zones: list[dict[str, int]],
+        pattern: tuple[int, int],
+    ) -> tuple[dict[int, "np.ndarray"], list[int]]:
+        detections: dict[int, "np.ndarray"] = {}
+        missing: list[int] = []
+        if not CV2_AVAILABLE or cv2 is None:
+            return detections, [int(z.get("index", -1)) for z in zones]
+        cols, rows = pattern
+        h, w = frame.shape[:2]
+
+        def to_u8(image: "np.ndarray") -> "np.ndarray":
+            arr = image.astype(np.float32, copy=False)
+            lo = float(np.percentile(arr, 1.0))
+            hi = float(np.percentile(arr, 99.0))
+            if hi <= lo:
+                hi = lo + 1.0
+            scaled = np.clip((arr - lo) * (255.0 / (hi - lo)), 0.0, 255.0).astype(np.uint8)
+            return cv2.GaussianBlur(scaled, (3, 3), 0)
+
+        for zone in zones:
+            idx = int(zone["index"])
+            x = max(0, min(int(zone["x"]), w - 1))
+            y = max(0, min(int(zone["y"]), h - 1))
+            ww = max(2, min(int(zone["width"]), w - x))
+            hh = max(2, min(int(zone["height"]), h - y))
+            patch = frame[y : y + hh, x : x + ww]
+            gray = to_u8(patch)
+            if hasattr(cv2, "findChessboardCornersSB"):
+                found, corners = cv2.findChessboardCornersSB(gray, (cols, rows), None)
+            else:
+                found, corners = (False, None)
+            if not found:
+                flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+                found, corners = cv2.findChessboardCorners(gray, (cols, rows), flags)
+                if found:
+                    criteria = (
+                        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                        30,
+                        0.001,
+                    )
+                    corners = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
+            if found and corners is not None:
+                pts = corners.reshape(-1, 2).astype(np.float32)
+                if pts.shape[0] == cols * rows:
+                    detections[idx] = pts
+                    continue
+            missing.append(idx)
+
+        return detections, missing
+
+    def _capture_geometry_frame(self) -> None:
+        if self.calibration_stage != 4 or not self.calibration_active:
+            self.status_var.set("Geometry calibration is available only in stage 4")
+            return
+        if self.geometry_processing_active:
+            self.status_var.set("Geometry solve already in progress")
+            return
+        if self.dark_capture_active or self.flat_capture_active:
+            self.status_var.set("Wait for active calibration burst to finish")
+            return
+        if self.last_frame is None:
+            self.status_var.set("No frame available for geometry capture")
+            return
+        if np is None or decode_buffer_to_ndarray is None:
+            self.status_var.set("Geometry calibration requires scientific decode modules")
+            return
+        if not CV2_AVAILABLE:
+            self.status_var.set("Geometry calibration requires OpenCV (opencv-python)")
+            return
+        pattern = self._parse_geometry_pattern()
+        if pattern is None:
+            return
+        zones = self._get_stage1_zones()
+        if zones is None:
+            self.status_var.set("Crop zones are missing. Complete Stage 1 again.")
+            return
+
+        frame = self.last_frame
+        meta = dict(frame.meta or {})
+        if "pixel_format_name" not in meta:
+            if self.camera_info.get("pixel_format"):
+                meta["pixel_format_name"] = str(self.camera_info.get("pixel_format"))
+            elif pixel_format_to_name is not None:
+                meta["pixel_format_name"] = pixel_format_to_name(frame.pixel_format)
+        pixel_format = meta.get("pixel_format_name", frame.pixel_format)
+        try:
+            raw_arr = decode_buffer_to_ndarray(frame.raw, frame.width, frame.height, pixel_format)
+        except Exception as exc:
+            self.status_var.set(f"Geometry capture failed (decode): {exc}")
+            return
+        if raw_arr.ndim != 2:
+            self.status_var.set("Geometry capture expects 2D raw frames")
+            return
+
+        work = raw_arr.astype(np.float32, copy=False)
+        if self.dark_map_mem is not None and self.dark_map_mem.shape == work.shape:
+            work = work - self.dark_map_mem
+        if self.flat_norm_mem is not None and self.flat_norm_mem.shape == work.shape:
+            safe = np.where(np.abs(self.flat_norm_mem) < 1e-6, 1e-6, self.flat_norm_mem)
+            work = work / safe
+
+        _, missing = self._detect_geometry_corners_on_zones(work, zones, pattern)
+        if missing:
+            missing_sorted = sorted(set(i for i in missing if 0 <= i < 16))
+            missing_label = ", ".join(str(i + 1) for i in missing_sorted)
+            detected_count = 16 - len(missing_sorted)
+            self.calibration_status_var.set(
+                f"Stage 4 check failed: chessboard detected in {detected_count}/16 lenses"
+            )
+            self.status_var.set(
+                f"Chessboard not found on all lenses. Missing lenses: {missing_label}. Frame not saved."
+            )
+            return
+
+        self.geometry_captured_frames.append(work.copy())
+        self.geometry_captured_meta.append(meta)
+        captured = len(self.geometry_captured_frames)
+        target = self.geometry_capture_target_frames
+
+        if captured < target:
+            self.geometry_capture_btn_var.set(f"Capture chess frame {captured + 1}/{target}")
+            self.calibration_status_var.set(f"Stage 4: captured chess frame {captured}/{target}")
+            self.status_var.set(f"Geometry capture: frame {captured}/{target} saved")
+            return
+
+        self.calib_geometry_btn.state(["disabled"])
+        self.geometry_processing_active = True
+        self.geometry_progress_var.set(2.0)
+        self.geometry_progress_text_var.set("Computing lens geometry, please wait...")
+        self.calibration_status_var.set("Stage 4: computing homographies...")
+        self.status_var.set("Geometry solve started")
+        root_dir = self._ensure_calibration_root_dir()
+        frames = [f.copy() for f in self.geometry_captured_frames]
+        metas = [dict(m) for m in self.geometry_captured_meta]
+        threading.Thread(
+            target=self._geometry_solve_worker,
+            args=(root_dir, frames, metas, zones, pattern),
+            daemon=True,
+        ).start()
+
+    def _geometry_solve_worker(
+        self,
+        root_dir: Path,
+        frames: list["np.ndarray"],
+        metas: list[dict[str, object]],
+        zones: list[dict[str, int]],
+        pattern: tuple[int, int],
+    ) -> None:
+        if not CV2_AVAILABLE:
+            self._push_ui_event("geometry_error", "OpenCV is not available. Install opencv-python.")
+            return
+        assert cv2 is not None
+        if not frames or len(zones) != 16:
+            self._push_ui_event("geometry_error", "Geometry solve failed: no frames or invalid zones.")
+            return
+
+        cols, rows = pattern
+        detections: dict[tuple[int, int], "np.ndarray"] = {}
+        total_steps = max(1, len(frames) * len(zones) + len(zones))
+        step = 0
+
+        def to_u8(image: "np.ndarray") -> "np.ndarray":
+            arr = image.astype(np.float32, copy=False)
+            lo = float(np.percentile(arr, 1.0))
+            hi = float(np.percentile(arr, 99.0))
+            if hi <= lo:
+                hi = lo + 1.0
+            scaled = np.clip((arr - lo) * (255.0 / (hi - lo)), 0.0, 255.0).astype(np.uint8)
+            return cv2.GaussianBlur(scaled, (3, 3), 0)
+
+        for f_idx, frame in enumerate(frames):
+            h, w = frame.shape[:2]
+            for zone in zones:
+                idx = int(zone["index"])
+                x = max(0, min(int(zone["x"]), w - 1))
+                y = max(0, min(int(zone["y"]), h - 1))
+                ww = max(2, min(int(zone["width"]), w - x))
+                hh = max(2, min(int(zone["height"]), h - y))
+                patch = frame[y : y + hh, x : x + ww]
+                gray = to_u8(patch)
+                if hasattr(cv2, "findChessboardCornersSB"):
+                    found, corners = cv2.findChessboardCornersSB(gray, (cols, rows), None)
+                else:
+                    found, corners = (False, None)
+                if not found:
+                    flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+                    found, corners = cv2.findChessboardCorners(gray, (cols, rows), flags)
+                    if found:
+                        criteria = (
+                            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                            30,
+                            0.001,
+                        )
+                        corners = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
+                if found and corners is not None:
+                    pts = corners.reshape(-1, 2).astype(np.float32)
+                    detections[(f_idx, idx)] = pts
+
+                step += 1
+                pct = min(95.0, 100.0 * step / float(total_steps))
+                self._push_ui_event(
+                    "geometry_progress",
+                    {"value": pct, "text": f"Detecting corners: frame {f_idx + 1}/{len(frames)}, lens {idx + 1}/16"},
+                )
+
+        counts = [0] * 16
+        for (_f, l), pts in detections.items():
+            if pts.shape[0] == cols * rows:
+                counts[l] += 1
+        ref_lens = int(np.argmax(np.asarray(counts)))
+        if counts[ref_lens] == 0:
+            self._push_ui_event("geometry_error", "Chessboard corners not found in any lens.")
+            return
+
+        homographies = np.full((16, 3, 3), np.nan, dtype=np.float64)
+        lens_entries: list[dict[str, object]] = []
+        for lens_idx in range(16):
+            step += 1
+            src_all: list["np.ndarray"] = []
+            dst_all: list["np.ndarray"] = []
+            frames_used = 0
+            for f_idx in range(len(frames)):
+                src = detections.get((f_idx, lens_idx))
+                dst = detections.get((f_idx, ref_lens))
+                if src is None or dst is None:
+                    continue
+                if src.shape[0] != dst.shape[0] or src.shape[0] < 4:
+                    continue
+                src_all.append(src)
+                dst_all.append(dst)
+                frames_used += 1
+
+            if lens_idx == ref_lens:
+                H = np.eye(3, dtype=np.float64)
+                homographies[lens_idx] = H
+                lens_entries.append(
+                    {
+                        "lens_index": lens_idx,
+                        "status": "ok",
+                        "reference_lens": True,
+                        "frames_used": frames_used,
+                        "H_lens_to_ref": H.tolist(),
+                    }
+                )
+            elif src_all:
+                src_pts = np.vstack(src_all).astype(np.float32)
+                dst_pts = np.vstack(dst_all).astype(np.float32)
+                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
+                if H is None:
+                    lens_entries.append(
+                        {
+                            "lens_index": lens_idx,
+                            "status": "failed",
+                            "frames_used": frames_used,
+                            "reason": "findHomography returned None",
+                        }
+                    )
+                else:
+                    homographies[lens_idx] = H.astype(np.float64)
+                    inliers = int(mask.sum()) if mask is not None else int(src_pts.shape[0])
+                    proj = cv2.perspectiveTransform(src_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+                    err = float(np.mean(np.linalg.norm(proj - dst_pts, axis=1)))
+                    lens_entries.append(
+                        {
+                            "lens_index": lens_idx,
+                            "status": "ok",
+                            "frames_used": frames_used,
+                            "points_used": int(src_pts.shape[0]),
+                            "inliers": inliers,
+                            "mean_reprojection_error_px": err,
+                            "H_lens_to_ref": H.tolist(),
+                        }
+                    )
+            else:
+                lens_entries.append(
+                    {
+                        "lens_index": lens_idx,
+                        "status": "insufficient_data",
+                        "frames_used": 0,
+                    }
+                )
+
+            pct = min(99.0, 100.0 * step / float(total_steps))
+            self._push_ui_event(
+                "geometry_progress",
+                {"value": pct, "text": f"Estimating homographies: lens {lens_idx + 1}/16"},
+            )
+
+        h_path = root_dir / "H_lens.npy"
+        frames_path = root_dir / "geometry_frames.npy"
+        json_path = root_dir / "geometry_calibration.json"
+        np.save(h_path, homographies)
+        np.save(frames_path, np.stack(frames, axis=0).astype(np.float32))
+        data = {
+            "stage": "stage_4_geometry_calibration",
+            "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "reference_lens": ref_lens,
+            "chessboard_inner_corners": {"cols": cols, "rows": rows},
+            "captures_count": len(frames),
+            "processing_domain": "raw_before_demosaic",
+            "files": {"homography_matrix": h_path.name, "captured_frames": frames_path.name},
+            "lenses": lens_entries,
+            "piecewise_warp": {
+                "enabled": False,
+                "grid": [3, 3],
+                "note": "Placeholder for future piecewise warp model.",
+            },
+        }
+        json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._push_ui_event(
+            "geometry_done",
+            {
+                "root_dir": str(root_dir),
+                "homography_file": h_path.name,
+                "frames_file": frames_path.name,
+                "metadata_file": json_path.name,
+                "reference_lens": ref_lens,
+                "captures_count": len(frames),
+                "board_cols": cols,
+                "board_rows": rows,
+            },
+        )
+
+    def _complete_calibration_stage1(self) -> None:
+        if not self.calibration_active or self.calibration_stage != 1:
+            self.status_var.set("Calibration stage 1 is not active")
+            return
+        if self.last_frame is None:
+            self.status_var.set("Calibration requires a live frame")
+            return
+        payload = self._build_stage1_crop_payload(self.last_frame)
+        try:
+            crop_path = self._save_stage1_crop_payload(payload)
+        except Exception as exc:
+            self.status_var.set(f"Failed to save crop.json: {exc}")
+            return
+        self.calibration_stage = 2
+        self.preview_canvas.delete("calib_overlay")
+        self._set_calibration_stage_ui(2)
+        self.calibration_status_var.set(
+            "Stage 1 complete. Stage 2: set Gain/Exposure, close lens, set burst frames, then click 'Create Dark Map'."
+        )
+        self.status_var.set(f"Calibration stage 1 saved: {crop_path}")
+
     def _poll_events(self) -> None:
         try:
             for _ in range(self.max_events_per_poll):
@@ -1801,6 +3166,10 @@ class BaumerLiveApp(tk.Tk):
                 elif kind == "frame":
                     if isinstance(payload, FramePacket):
                         self.last_frame = payload
+                        if self.dark_capture_active:
+                            self._consume_dark_capture_frame(payload)
+                        if self.flat_capture_active:
+                            self._consume_flat_capture_frame(payload)
                         now = time.monotonic()
                         self._rx_frames += 1
                         rx_dt = now - self._rx_fps_window_ts
@@ -1830,10 +3199,69 @@ class BaumerLiveApp(tk.Tk):
                 elif kind == "auto_fix_done":
                     self.auto_fix_running = False
                     self.status_var.set(str(payload))
+                elif kind == "geometry_progress":
+                    if self.calibration_active and isinstance(payload, dict):
+                        value = float(payload.get("value", 0.0))
+                        text = str(payload.get("text", ""))
+                        self.geometry_progress_var.set(max(0.0, min(100.0, value)))
+                        self.geometry_progress_text_var.set(text)
+                elif kind == "geometry_done":
+                    self.geometry_processing_active = False
+                    if not self.calibration_active:
+                        continue
+                    self.geometry_progress_var.set(100.0)
+                    self.geometry_progress_text_var.set("Geometry solve complete.")
+                    if isinstance(payload, dict):
+                        self._update_calibration_session_json(
+                            {
+                                "stage_4_status": "completed",
+                                "stage_4_homography_file": payload.get("homography_file"),
+                                "stage_4_frames_file": payload.get("frames_file"),
+                                "stage_4_metadata_file": payload.get("metadata_file"),
+                                "stage_4_reference_lens": payload.get("reference_lens"),
+                                "stage_4_captures_count": payload.get("captures_count"),
+                                "next_stage": "stage_5_not_implemented",
+                            }
+                        )
+                        self.calibration_stage = 5
+                        self._set_calibration_stage_ui(5)
+                        self.calibration_status_var.set(
+                            "Stage 4 complete: lens geometry calibrated. Stage 5 is not implemented."
+                        )
+                        self.status_var.set(f"Geometry calibration done: {payload.get('root_dir')}")
+                elif kind == "geometry_error":
+                    self.geometry_processing_active = False
+                    if not self.calibration_active:
+                        continue
+                    self.geometry_progress_var.set(0.0)
+                    self.geometry_progress_text_var.set("")
+                    self._set_calibration_stage_ui(self.calibration_stage)
+                    self.status_var.set(str(payload))
                 elif kind == "error":
                     self.status_var.set(f"Error: {payload}")
                 elif kind == "disconnected":
                     self.status_var.set("Disconnected")
+                    self.calibration_active = False
+                    self.calibration_drag_active = False
+                    self.calibration_stage = 0
+                    self.dark_capture_active = False
+                    self.flat_capture_active = False
+                    self.geometry_processing_active = False
+                    self.dark_capture_frames = []
+                    self.dark_capture_frame_meta = []
+                    self.flat_capture_frames = []
+                    self.flat_capture_frame_meta = []
+                    self.calibration_capture_target_frames = 0
+                    self.geometry_captured_frames = []
+                    self.geometry_captured_meta = []
+                    self.geometry_progress_var.set(0.0)
+                    self.geometry_progress_text_var.set("")
+                    self.geometry_capture_btn_var.set(f"Capture chess frame 1/{self.geometry_capture_target_frames}")
+                    self.calibration_session_dir = None
+                    self._set_calibration_panel_visible(False)
+                    self._set_calibration_stage_ui(0)
+                    self.preview_canvas.delete("calib_overlay")
+                    self._display_image_rect = None
                     if self.active_session_writer is not None:
                         self._finalize_active_session("Capture stopped: camera disconnected")
         except queue.Empty:
@@ -1861,6 +3289,7 @@ class BaumerLiveApp(tk.Tk):
         cy = self.preview_canvas.winfo_height() // 2
         self.preview_canvas.coords(self.canvas_image_id, cx, cy)
         self.preview_canvas.coords(self.canvas_text_id, cx, cy)
+        self._draw_calibration_overlay()
 
     def _render_frame(self, frame: FramePacket) -> None:
         if frame.width <= 0 or frame.height <= 0:
@@ -1873,6 +3302,11 @@ class BaumerLiveApp(tk.Tk):
             return
         rot = self._get_rotation_deg()
         zoom = max(0.25, min(4.0, float(self.zoom_var.get())))
+        if self.calibration_active and self.calibration_stage == 1:
+            # Stage-1 crop grid is defined in raw sensor coordinates.
+            # Keep preview transform neutral while user positions the grid.
+            rot = 0
+            zoom = 1.0
         frame_meta = frame.meta or {}
         pixel_format_name = str(
             frame_meta.get("pixel_format_name")
@@ -1949,6 +3383,20 @@ class BaumerLiveApp(tk.Tk):
         self.preview_canvas.itemconfigure(self.canvas_image_id, image=photo, state="normal")
         self.preview_canvas.itemconfigure(self.canvas_text_id, state="hidden")
         self._on_canvas_resize(None)
+        canvas_w = max(1, self.preview_canvas.winfo_width())
+        canvas_h = max(1, self.preview_canvas.winfo_height())
+        self._display_image_rect = (
+            (canvas_w - out_w) * 0.5,
+            (canvas_h - out_h) * 0.5,
+            float(out_w),
+            float(out_h),
+        )
+        self._display_raw_size = (int(frame.width), int(frame.height))
+        if self.calibration_active and self.calibration_stage == 1:
+            self._ensure_calibration_grid_for_frame(frame, reset=False)
+            self._draw_calibration_overlay()
+        else:
+            self.preview_canvas.delete("calib_overlay")
         now = time.monotonic()
         self._render_frames += 1
         render_dt = now - self._render_fps_window_ts
@@ -2002,18 +3450,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
-    app = BaumerLiveApp(
-        interface=args.interface,
-        camera_ip=args.camera,
-        snapshot_dir=Path(args.snapshot_dir).expanduser(),
-        packet_size=args.packet_size,
-        packet_delay=args.packet_delay,
-        preview_fps=args.preview_fps,
-        ui_poll_ms=args.ui_poll_ms,
-    )
-    app.mainloop()
-    return 0
+    from baumer_hydra_gui import main as hydra_main  # type: ignore
+
+    return int(hydra_main())
 
 
 if __name__ == "__main__":

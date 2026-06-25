@@ -99,7 +99,11 @@ def send_force_ip(
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, struct.pack("I", interface_index))
-    s.bind((host_ip, 0))
+    # Bind to INADDR_ANY so broadcast ACK packets are delivered reliably.
+    try:
+        s.bind(("", 0))
+    except OSError:
+        s.bind((host_ip, 0))
     s.settimeout(0.25)
 
     for _ in range(3):
@@ -117,8 +121,11 @@ def send_force_ip(
             continue
         status, ack, _payload_len, rid = struct.unpack(">HHHH", data[:8])
         if rid == req_id and ack == 0x0005:
-            print(f"FORCEIP_ACK from {addr[0]} status=0x{status:04x}")
-            got_ack = status == 0
+            print(f"FORCEIP_ACK from {addr[0]} status_word=0x{status:04x}")
+            # Many cameras send FORCEIP_ACK with a vendor/protocol marker
+            # in the first 16-bit word instead of a pure status field.
+            # Matching req_id + ACK opcode is enough to treat this as success.
+            got_ack = True
             break
 
     s.close()

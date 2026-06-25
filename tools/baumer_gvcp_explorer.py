@@ -190,7 +190,12 @@ def discover(interface: str, duration: float, interval: float) -> List[CameraInf
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, struct.pack("I", interface_index))
-    sock.bind((source_ip, 0))
+    # Bind to INADDR_ANY so broadcast replies to 255.255.255.255 / subnet
+    # broadcast are received reliably on macOS.
+    try:
+        sock.bind(("", 0))
+    except OSError:
+        sock.bind((source_ip, 0))
     sock.settimeout(0.15)
 
     discovered: dict[str, CameraInfo] = {}

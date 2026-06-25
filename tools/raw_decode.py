@@ -101,6 +101,8 @@ def _to_u8_for_preview(raw_array: np.ndarray, pixel_format_name: str) -> np.ndar
     if raw_array.dtype == np.uint8:
         return raw_array
     fmt = pixel_format_name.upper()
+    if fmt in {"MONO8", "BAYERRG8", "BAYERGB8"}:
+        return np.clip(raw_array, 0, 255).astype(np.uint8)
     if "12" in fmt:
         return np.clip(raw_array.astype(np.uint16) >> 4, 0, 255).astype(np.uint8)
     if "10" in fmt:
@@ -170,4 +172,3 @@ def save_preview_png(path: Path, rgb_u8: np.ndarray) -> None:
         raise RawDecodeError("Pillow is required for preview PNG export.")
     img = Image.fromarray(rgb_u8, mode="RGB")
     img.save(path)
-

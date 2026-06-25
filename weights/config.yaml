@@ -1,0 +1,99 @@
+seed: 42
+
+paths:
+  data_root: data/Calib
+  output_dir: ./outputs
+
+data:
+  # Fine-tune on a single calibration pair: disable val/test splits.
+  train_only: true
+  patch_size: 48
+  val_patch_size: 48
+  train_samples_per_epoch: 256
+  batch_size: 8
+  val_batch_size: 1
+  num_workers: 0
+  pin_memory: true
+  cache_data: true
+
+augment:
+  # Keep augmentations minimal for calibration (reduce drift).
+  hflip_prob: 0.0
+  vflip_prob: 0.0
+  rot90_prob: 0.0
+  noise_std_min: 0.0
+  noise_std_max: 0.0
+  blur_prob: 0.0
+  blur_band_prob: 0.0
+  blur_sigma_min: 0.2
+  blur_sigma_max: 1.5
+  blur_ksize: 3
+  blotch_prob: 0.0
+  blotch_count_min: 1
+  blotch_count_max: 3
+  blotch_radius_min: 4
+  blotch_radius_max: 14
+  shift_max: 0.0
+
+model:
+  in_channels: 48
+  dim: 64
+  num_heads: 4
+  window_size: 8
+  enc_blocks: [3, 3]
+  latent_blocks: 6
+  dec_blocks: [3, 3]
+  ff_mult: 2.5
+  dropout: 0.05
+
+loss:
+  w_sam: 1.0
+  w_l1_low: 1.5
+  w_spectral_smooth: 0.2
+  w_hf: 0.4
+  w_grad: 0.0
+  w_gate: 0.05
+  w_mid_gt: 0.6
+  w_grad_adaptive: 0.3
+  lowpass_kernel: 7
+  lowpass_sigma: 1.2
+  midfreq_kernel: 3
+  midfreq_sigma: 0.5
+  hf_kernel: 5
+  hf_sigma: 1.0
+  sharpness_pool: 7
+  sharpness_temperature: 0.15
+  grad_adapt_temperature: 1.0
+  mask_synthetic_occlusions: true
+
+optim:
+  # Conservative LR + short run to "calibrate" on a single scene.
+  lr: 2.0e-5
+  min_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.99]
+  epochs: 3
+  warmup_epochs: 0
+  warmup_start_factor: 0.05
+
+trainer:
+  accelerator: mps
+  devices: 1
+  precision: 32-true
+  gradient_clip_val: 0.5
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  deterministic: false
+
+logging:
+  tensorboard: true
+  wandb: false
+  project: hsi-restoration
+  run_name: hyper-restormer-lite-calib
+  save_images_every_n_epochs: 1
+  rgb_bands: [32, 20, 10]
+  band_viz_count: 4
+
+checkpoint:
+  monitor_sam: val/sam
+  monitor_psnr_low: val/psnr_low

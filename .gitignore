@@ -1,5 +1,6 @@
 # macOS / editor
 .DS_Store
+._*
 
 # Python
 __pycache__/
@@ -13,6 +14,23 @@ venv/
 # Runtime artifacts
 capture/
 tmp/
+analysis_tmp/
+session_*/
+*.npy
+*.npz
 
 # Logs
 *.log
+
+# Local model checkpoints are large binary artifacts. Keep lightweight
+# metadata in weights/ tracked, but store checkpoint files outside git.
+weights/*.ckpt
+weights/*.pt
+weights/*.pth
+weights/*.safetensors
+
+# ML/model download caches
+.cache/
+modelscope_cache/
+huggingface/
+hf-cache/

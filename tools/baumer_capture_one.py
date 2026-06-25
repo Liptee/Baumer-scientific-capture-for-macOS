@@ -14,6 +14,7 @@ import fcntl
 import json
 import socket
 import struct
+import subprocess
 import time
 from pathlib import Path
 
@@ -31,6 +32,9 @@ def save_pgm(path: Path, width: int, height: int, image_bytes: bytes) -> None:
 
 
 def get_interface_ipv4(interface: str) -> str | None:
+    entries = get_interface_ipv4_entries(interface)
+    if entries:
+        return entries[0][0]
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         packed = struct.pack("256s", interface[:15].encode("ascii", errors="ignore"))
@@ -44,6 +48,118 @@ def get_interface_ipv4(interface: str) -> str | None:
 
 def ipv4_to_u32(value: str) -> int:
     return int.from_bytes(socket.inet_aton(value), "big", signed=False)
+
+
+def ip_to_int(ip: str) -> int:
+    return int.from_bytes(socket.inet_aton(ip), "big", signed=False)
+
+
+def same_subnet(ip_a: str, ip_b: str, mask: str) -> bool:
+    try:
+        ma = ip_to_int(mask)
+        return (ip_to_int(ip_a) & ma) == (ip_to_int(ip_b) & ma)
+    except Exception:
+        return False
+
+
+def _decode_ifconfig_netmask(token: str) -> str:
+    if token.startswith("0x"):
+        try:
+            return socket.inet_ntoa(struct.pack(">I", int(token, 16)))
+        except Exception:
+            return "255.255.255.0"
+    return token
+
+
+def get_interface_ipv4_entries(interface: str) -> list[tuple[str, str]]:
+    try:
+        out = subprocess.check_output(["ifconfig", interface], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    entries: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 4 or parts[0] != "inet" or parts[2] != "netmask":
+            continue
+        ip = parts[1]
+        if ip.startswith("127."):
+            continue
+        entries.append((ip, _decode_ifconfig_netmask(parts[3])))
+    return entries
+
+
+def get_interface_ipv4_for_peer(interface: str, peer_ip: str) -> str | None:
+    entries = get_interface_ipv4_entries(interface)
+    if not entries:
+        return get_interface_ipv4(interface)
+    if is_ipv4_literal(peer_ip):
+        for ip, mask in entries:
+            if same_subnet(ip, peer_ip, mask):
+                return ip
+    return entries[0][0]
+
+
+def is_ipv4_literal(value: str) -> bool:
+    try:
+        socket.inet_aton(value)
+        return value.count(".") == 3
+    except OSError:
+        return False
+
+
+def open_camera_with_fallback(Aravis, camera_id: str, interface: str) -> tuple[object | None, str]:
+    errors: list[str] = []
+
+    try:
+        camera = Aravis.Camera.new(camera_id)
+        if camera is not None:
+            return camera, ""
+        errors.append("Aravis.Camera.new returned None")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Aravis.Camera.new failed: {exc}")
+
+    if not is_ipv4_literal(camera_id):
+        return None, "; ".join(errors)
+
+    try:
+        from gi.repository import Gio  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Gio import failed for GvDevice fallback: {exc}")
+        return None, "; ".join(errors)
+
+    if_ip = get_interface_ipv4_for_peer(interface, camera_id)
+    if not if_ip:
+        errors.append(f"Interface {interface} has no IPv4 for GvDevice fallback")
+        return None, "; ".join(errors)
+
+    try:
+        iface_addr = Gio.InetAddress.new_from_string(if_ip)
+        dev_addr = Gio.InetAddress.new_from_string(camera_id)
+        if iface_addr is None or dev_addr is None:
+            raise RuntimeError("Failed to parse interface/camera IPv4")
+        device = Aravis.GvDevice.new(iface_addr, dev_addr)
+        camera = Aravis.Camera.new_with_device(device)
+        if camera is None:
+            raise RuntimeError("Aravis.Camera.new_with_device returned None")
+        return camera, "opened via GvDevice fallback"
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"GvDevice fallback failed: {exc}")
+        return None, "; ".join(errors)
+
+
+def configure_aravis_gige_interface(Aravis, interface: str) -> None:
+    try:
+        Aravis.GvInterface.set_discovery_interface_name(interface)
+    except Exception:
+        pass
+    # Some cameras send discovery replies as broadcast; without this Aravis
+    # may miss device enumeration or choose unstable paths on macOS.
+    try:
+        flags = int(getattr(Aravis.GvInterfaceFlags, "ACK", 0))
+        if flags:
+            Aravis.set_interface_flags("GigEVision", flags)
+    except Exception:
+        pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,17 +221,18 @@ def main() -> int:
     gi.require_version("Aravis", "0.8")
     from gi.repository import Aravis  # type: ignore
 
-    Aravis.GvInterface.set_discovery_interface_name(args.interface)
-
+    configure_aravis_gige_interface(Aravis, args.interface)
     try:
-        camera = Aravis.Camera.new(args.camera)
-    except Exception as exc:  # noqa: BLE001
-        print(f"ERROR: failed to create camera object: {exc}")
-        return 3
+        Aravis.update_device_list()
+    except Exception:
+        pass
 
+    camera, open_note = open_camera_with_fallback(Aravis, args.camera, args.interface)
     if camera is None:
-        print("ERROR: camera not found. Check IP/route/interface.")
+        print(f"ERROR: failed to create camera object: {open_note}")
         return 4
+    if open_note:
+        print(f"Connect note: {open_note}")
 
     # Avoid packet socket path on systems where raw socket usage is restricted.
     camera.gv_set_stream_options(Aravis.GvStreamOption.PACKET_SOCKET_DISABLED)
@@ -154,7 +271,7 @@ def main() -> int:
 
     # Force stream destination to selected interface address/port.
     if args.interface:
-        if_ip = get_interface_ipv4(args.interface)
+        if_ip = get_interface_ipv4_for_peer(args.interface, args.camera)
         if if_ip:
             try:
                 if hasattr(stream, "get_port"):
