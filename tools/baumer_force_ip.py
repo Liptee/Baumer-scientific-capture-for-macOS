@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""
-Force temporary IPv4 address for a GigE Vision camera (GVCP FORCEIP_CMD).
-
-This script sends broadcast FORCEIP command (0x0004) bound to a selected
-interface and updates camera network settings without requiring vendor SDK.
-"""
+"""Временная настройка IPv4 GigE Vision камеры для Hydra GUI."""
 
 from __future__ import annotations
 
-import argparse
 import fcntl
 import socket
 import struct
@@ -130,32 +124,3 @@ def send_force_ip(
 
     s.close()
     return got_ack
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="GigE Vision FORCEIP sender")
-    parser.add_argument("--interface", required=True, help="e.g. en10")
-    parser.add_argument("--mac", required=True, help="target camera MAC, e.g. 00:06:be:01:9c:18")
-    parser.add_argument("--ip", required=True, help="new temporary camera IP")
-    parser.add_argument("--mask", default="255.255.0.0", help="new subnet mask")
-    parser.add_argument("--gateway", default="0.0.0.0", help="new gateway")
-    args = parser.parse_args()
-
-    ok = send_force_ip(
-        interface=args.interface,
-        target_mac=args.mac,
-        ip=args.ip,
-        subnet=args.mask,
-        gateway=args.gateway,
-    )
-
-    if ok:
-        print("FORCEIP completed with ACK status=0")
-        return 0
-
-    print("FORCEIP sent (no ACK). Camera may still apply new IP; verify with discovery.")
-    return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

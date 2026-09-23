@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""
-Minimal GigE Vision discovery tool for macOS.
-
-It binds discovery traffic to a specific interface (IP_BOUND_IF), so the tool
-can still find cameras even when macOS has conflicting link-local routes.
-"""
+"""GVCP-обнаружение GigE Vision камер для Hydra GUI на macOS."""
 
 from __future__ import annotations
 
-import argparse
-import json
 import socket
 import struct
 import subprocess
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import List, Optional
 
 import fcntl
@@ -232,77 +225,3 @@ def discover(interface: str, duration: float, interval: float) -> List[CameraInf
         sock.close()
 
     return list(discovered.values())
-
-
-def print_human(cameras: List[CameraInfo], interface: str) -> None:
-    if not cameras:
-        print(f"No GVCP discovery replies on {interface}.")
-        return
-
-    print(f"Discovered {len(cameras)} device(s) on {interface}:")
-    for idx, cam in enumerate(cameras, start=1):
-        print("")
-        print(f"[{idx}] {cam.source_ip} ({cam.mac})")
-        print(f"  vendor/model: {cam.manufacturer_name} / {cam.model_name}")
-        print(f"  serial: {cam.serial_number}")
-        print(f"  GeV version: {cam.gev_version}")
-        print(f"  current IP: {cam.current_ip} mask {cam.current_subnet}")
-        print(
-            f"  persistent IP: {cam.persistent_ip} mask {cam.persistent_subnet} gw {cam.persistent_gateway}"
-        )
-        if cam.device_version:
-            print(f"  device version: {cam.device_version}")
-        if cam.manufacturer_info:
-            print(f"  manufacturer info: {cam.manufacturer_info}")
-        if cam.user_defined_name:
-            print(f"  user name: {cam.user_defined_name}")
-        print(
-            f"  ip cfg flags: options={cam.ip_cfg_options_hex} current={cam.ip_cfg_current_hex}"
-        )
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Baumer/GigE Vision discovery for macOS")
-    parser.add_argument(
-        "--interface",
-        required=True,
-        help="Network interface for camera traffic, e.g. en10",
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=4.0,
-        help="Discovery time window in seconds (default: 4.0)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=float,
-        default=0.25,
-        help="Broadcast interval in seconds (default: 0.25)",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print machine-readable JSON",
-    )
-    args = parser.parse_args()
-
-    try:
-        cameras = discover(args.interface, args.duration, args.interval)
-    except RuntimeError as exc:
-        print(f"ERROR: {exc}")
-        return 2
-    except PermissionError as exc:
-        print(f"ERROR: permission denied: {exc}")
-        return 3
-
-    if args.json:
-        print(json.dumps([asdict(c) for c in cameras], indent=2, ensure_ascii=False))
-    else:
-        print_human(cameras, args.interface)
-
-    return 0 if cameras else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

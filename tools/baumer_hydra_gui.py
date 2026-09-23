@@ -87,7 +87,6 @@ except Exception:  # pragma: no cover - runtime dependency
     convolve1d = None  # type: ignore[assignment]
     gaussian_filter = None  # type: ignore[assignment]
 
-from baumer_capture_one import configure_aravis_gige_interface, open_camera_with_fallback
 from camera_control import read_buffer_metadata, read_camera_runtime_metadata
 from raw_decode import decode_buffer_to_ndarray, pixel_format_to_name
 
@@ -157,6 +156,58 @@ def get_interface_ipv4_for_peer(interface: str, peer_ip: str) -> str | None:
             if same_subnet(ip, peer_ip, mask):
                 return ip
     return entries[0][0]
+
+
+def configure_aravis_gige_interface(Aravis, interface: str) -> None:
+    try:
+        Aravis.GvInterface.set_discovery_interface_name(interface)
+    except Exception:
+        pass
+    try:
+        flags = int(getattr(Aravis.GvInterfaceFlags, "ACK", 0))
+        if flags:
+            Aravis.set_interface_flags("GigEVision", flags)
+    except Exception:
+        pass
+
+
+def open_camera_with_fallback(Aravis, camera_id: str, interface: str) -> tuple[object | None, str]:
+    errors: list[str] = []
+    try:
+        camera = Aravis.Camera.new(camera_id)
+        if camera is not None:
+            return camera, ""
+        errors.append("Aravis.Camera.new returned None")
+    except Exception as exc:
+        errors.append(f"Aravis.Camera.new failed: {exc}")
+
+    if not is_ipv4_literal(camera_id):
+        return None, "; ".join(errors)
+
+    try:
+        from gi.repository import Gio  # type: ignore  # noqa: PLC0415
+    except Exception as exc:
+        errors.append(f"Gio import failed for GvDevice fallback: {exc}")
+        return None, "; ".join(errors)
+
+    interface_ip = get_interface_ipv4_for_peer(interface, camera_id)
+    if not interface_ip:
+        errors.append(f"Interface {interface} has no IPv4 for GvDevice fallback")
+        return None, "; ".join(errors)
+
+    try:
+        interface_address = Gio.InetAddress.new_from_string(interface_ip)
+        camera_address = Gio.InetAddress.new_from_string(camera_id)
+        if interface_address is None or camera_address is None:
+            raise RuntimeError("Failed to parse interface/camera IPv4")
+        device = Aravis.GvDevice.new(interface_address, camera_address)
+        camera = Aravis.Camera.new_with_device(device)
+        if camera is None:
+            raise RuntimeError("Aravis.Camera.new_with_device returned None")
+        return camera, "opened via GvDevice fallback"
+    except Exception as exc:
+        errors.append(f"GvDevice fallback failed: {exc}")
+        return None, "; ".join(errors)
 
 
 def get_interface_netmask(interface: str) -> str | None:
@@ -4638,15 +4689,12 @@ class HydraWizardApp(tk.Tk):
         if proc is not None:
             self._stop_recon_worker_locked()
 
-        infer_py = Path("/Users/mac/Desktop/HSIRestore/infer.py")
         weights_dir = self._weights_dir()
         config_path = weights_dir / "config.yaml"
         ckpt_path = weights_dir / "weights.ckpt"
         worker_script = self._recon_worker_script_path()
         if not worker_script.exists():
             raise RuntimeError(f"recon worker script not found: {worker_script}")
-        if not infer_py.exists():
-            raise RuntimeError(f"infer.py not found: {infer_py}")
         if not config_path.exists():
             raise RuntimeError(f"config.yaml not found: {config_path}")
         if not ckpt_path.exists():
@@ -4656,8 +4704,6 @@ class HydraWizardApp(tk.Tk):
             sys.executable,
             "-u",
             str(worker_script),
-            "--infer-py",
-            str(infer_py),
             "--config",
             str(config_path),
             "--checkpoint",

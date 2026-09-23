@@ -1,57 +1,48 @@
-# Baumer Camera (macOS, Python, Aravis)
+# HydraSoft — приложение для камеры Baumer Hydra
 
-Легковесный проект для работы с GigE-камерой Baumer на macOS:
+Проект содержит только основное приложение `baumer_hydra_gui.py` и его непосредственные зависимости. Программа подключается к GigE-камере Baumer, проводит калибровку 16 оптических каналов, показывает живое изображение, сохраняет снимки и выполняет HSI-реконструкцию, анализ и классификацию.
 
-- live preview GUI (`Tkinter`)
-- Hydra calibration/capture GUI with face segmentation/classification workflow
-- scientific RAW capture sessions (`.npy + .json`)
-- инструменты обнаружения и восстановления IP камеры
+## Состав проекта
 
-## Что в репозитории
+- `tools/baumer_hydra_gui.py` — главное окно подключения, калибровки и съёмки;
+- `tools/baumer_gvcp_explorer.py` — обнаружение GigE Vision камеры для функции
+  `Auto Find/Fix`;
+- `tools/baumer_force_ip.py` — временная установка IP камеры из
+  `Auto Find/Fix`;
+- `tools/camera_control.py` — чтение метаданных камеры и кадров;
+- `tools/raw_decode.py` — декодирование RAW-буферов;
+- `tools/hsi_restore_runtime.py` — встроенная архитектура реконструирующей сети
+  и обработка HSI-кубов;
+- `tools/hsi_recon_worker.py` — отдельный процесс HSI-реконструкции;
+- `weights/config.yaml` — конфигурация модели реконструкции;
+- `weights/weights.ckpt` — основной checkpoint реконструкции;
+- `weights/wavelengths.txt` — длины волн каналов;
+- `weights/face_cls_model.json` — параметры классификатора лица;
+- `capture/` — рабочие калибровочные сессии и результаты съёмки.
 
-- `tools/baumer_hydra_gui.py` - Hydra GUI: calibration, capture, analysis, face segmentation/classification
-- `tools/baumer_live_gui.py` - легковесное live preview GUI
-- `tools/baumer_capture_one.py` - CLI захват кадров/сессий
-- `tools/baumer_gvcp_explorer.py` - discovery камер по GVCP
-- `tools/baumer_force_ip.py` - временная смена IP камеры (FORCEIP)
-- `tools/baumer_network_diagnose.sh` - диагностика сети/маршрутов
-- `tools/capture_profiles.py` - capture profiles
-- `tools/camera_control.py` - scientific camera configuration
-- `tools/raw_decode.py` - raw decode layer
-- `tools/capture_session.py` - session writer
-- `tools/hsi_recon_worker.py` - worker для HSI-реконструкции в analysis/classification pipeline
-- `tools/train_face_spectrum_classifier.py` - обучение простого спектрального face classifier
-- `weights/` - lightweight config/metadata для реконструкции и классификации
-- `docs/macos-network-setup.md` - подробный сетевой гайд
+Каталог `capture/` и большие checkpoint-файлы не отслеживаются Git. Не удаляйте нужную калибровочную сессию: её можно повторно загрузить при следующем запуске.
 
 ## Требования
 
-- macOS
-- Homebrew
-- Python `3.14`
-- Aravis + `gi.repository` (PyGObject)
-- Tkinter для Python 3.14
-- локальные checkpoint-файлы реконструкции в `weights/` (не хранятся в git)
+- Homebrew;
+- Python 3.14 с Tkinter;
+- Aravis 0.8 и PyGObject (`gi.repository`);
+- Python-зависимости из `requirements.txt`;
+- камера и компьютер в одной IPv4-подсети.
 
-## Развертывание
+Код реконструирующей сети включён в этот проект. Отдельный проект
+`HSIRestore` для запуска приложения не требуется.
 
-### 1) Клонирование
-
-```bash
-git clone <YOUR_REPO_URL>
-cd HydraSoft
-```
-
-### 2) Системные зависимости (Homebrew)
+## Установка
+### 1. Системные компоненты
 
 ```bash
 brew update
 brew install python@3.14 python-tk@3.14 aravis pygobject3 gobject-introspection pkg-config
 ```
 
-### 3) Python-зависимости
-
-Рекомендуемый вариант - локальное виртуальное окружение в корне проекта:
+### 2. Виртуальное окружение
+Из корня проекта:
 
 ```bash
 /opt/homebrew/opt/python@3.14/bin/python3.14 -m venv .venv
@@ -60,218 +51,237 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Если `gi.repository` не виден из `.venv`, разрешите окружению видеть Homebrew site-packages:
-
-```bash
-python - <<'PY'
-from pathlib import Path
-p = Path(".venv/pyvenv.cfg")
-s = p.read_text()
-s = s.replace("include-system-site-packages = false", "include-system-site-packages = true")
-p.write_text(s)
-PY
-```
-
-### 4) Быстрая проверка
-
-```bash
-source .venv/bin/activate
-python -c "import tkinter; import gi; gi.require_version('Aravis', '0.8'); from gi.repository import Aravis; print('Tk/Aravis OK')"
-python -m py_compile tools/baumer_hydra_gui.py tools/baumer_capture_one.py
-python tools/baumer_capture_one.py --help
-```
-
-### 5) Локальные веса
-
-Большие checkpoint-файлы не коммитятся. Для HSI-реконструкции положите их в `weights/`:
+`gi.repository` обычно устанавливается Homebrew, а не `pip`. Если модуль `gi`
+не виден из виртуального окружения, в `.venv/pyvenv.cfg` установите:
 
 ```text
-weights/weights.ckpt
-weights/weights_base.ckpt          # optional
-weights/weights_for_shpak.ckpt     # optional
+include-system-site-packages = true
 ```
 
-Лёгкие файлы `weights/config.yaml`, `weights/wavelengths.txt` и
-`weights/face_cls_model.json` можно хранить в git.
+После изменения заново активируйте окружение.
 
-### 6) Запуск Hydra GUI
+### 3. Файлы HSI-реконструкции
+Проверьте наличие файлов:
+```text
+HydraSoft/weights/config.yaml
+HydraSoft/weights/weights.ckpt
+HydraSoft/weights/wavelengths.txt
+```
+
+### 4. Проверка окружения
 
 ```bash
-cd /path/to/HydraSoft
 source .venv/bin/activate
-GST_PLUGIN_PATH=/opt/homebrew/opt/aravis/lib/gstreamer-1.0 python tools/baumer_hydra_gui.py
+python -c "import tkinter, gi; gi.require_version('Aravis', '0.8'); from gi.repository import Aravis; print('Tkinter и Aravis доступны')"
+python -m py_compile tools/*.py
+python tools/baumer_hydra_gui.py --help
 ```
 
-Если окно Tk падает при запуске из sandboxed terminal, запустите ту же команду из обычного macOS Terminal.
+## Настройка подключения к камере
 
-### 7) Запуск lightweight live GUI
-
-```bash
-cd /path/to/HydraSoft
-source .venv/bin/activate
-GST_PLUGIN_PATH=/opt/homebrew/opt/aravis/lib/gstreamer-1.0 python tools/baumer_live_gui.py
-```
-
-## Настройки сети
-Перед первым запуском обязательно выполните сетевую настройку.
-
-### 1) Узнать имя Ethernet-интерфейса камеры
+### 1. Найдите Ethernet-интерфейс
 
 ```bash
 networksetup -listallhardwareports
 ```
-Найдите ваш USB-Ethernet адаптер (например `AX88179A`) и его `Device` (например `en10`).
 
-### 2) Настроить IP хоста в той же подсети камеры
+Найдите адаптер, к которому подключена камера, и запомните значение `Device`,
+например `en10`.
 
-Если IP камеры неизвестен, временно задайте на интерфейсе любую private-подсеть, например:
-
-```bash
-sudo ifconfig <CAMERA_IFACE> inet 192.168.88.10 netmask 255.255.255.0 up
-```
-
-Если у вас уже известная подсеть камеры - используйте её.
-
-### 3) Проверить discovery
+### 2. Проверьте физическое соединение
 
 ```bash
-source .venv/bin/activate
-python tools/baumer_gvcp_explorer.py \
-  --interface <CAMERA_IFACE> \
-  --duration 4
+ifconfig en10
 ```
 
-Если discovery не видит камеру, проверьте:
-- кабель/питание камеры и линк (`ifconfig <CAMERA_IFACE>`, `status: active`)
-- что интерфейс не inactive в macOS Network Settings
-- что VPN/корпоративный firewall не мешает локальному трафику
-- что маршрут не уходит в `en0` (Wi-Fi)
+Интерфейс должен иметь состояние `status: active`. Если он неактивен, проверьте
+питание камеры, кабель и Ethernet-адаптер.
 
-### 4) Если камера в wrong subnet - применить FORCEIP
+### 3. Назначьте компьютеру IPv4-адрес
+
+IP компьютера и камеры должны находиться в одной подсети, но не совпадать.
+Например, для камеры `192.168.88.1`:
 
 ```bash
-source .venv/bin/activate
-python tools/baumer_force_ip.py \
-  --interface <CAMERA_IFACE> \
-  --mac <CAMERA_MAC> \
-  --ip <TARGET_CAMERA_IP> \
-  --mask <TARGET_MASK> \
-  --gateway 0.0.0.0
+sudo ifconfig en10 inet 192.168.88.10 netmask 255.255.255.0 up
 ```
 
-После этого снова запустите `baumer_gvcp_explorer.py`.
+На выделенном интерфейсе камеры не задавайте шлюз по умолчанию. Интернет лучше
+оставить на Wi-Fi. На время первой настройки рекомендуется отключить VPN.
 
-### 5) Если маршрут на IP камеры идет не через camera interface
+### 4. Подключитесь из приложения
+
+В первом окне:
+
+1. Введите имя интерфейса в поле `Interface`, например `en10`.
+2. Если IP камеры известен, введите его в `Camera ID / IP` и нажмите `Connect`.
+3. Если IP неизвестен, нажмите `Scan Cameras`, выберите найденную камеру и
+   нажмите `Connect`.
+4. Если камера находится в другой подсети, нажмите `Auto Find/Fix`. Функция
+   выполняет GVCP-обнаружение и при необходимости временно назначает камере
+   свободный IP в подсети выбранного интерфейса.
+
+`Auto Find/Fix` использует временный ForceIP. После отключения питания камера
+может вернуться к постоянным сетевым настройкам.
+
+Проверить маршрут к известному адресу камеры можно командой:
 
 ```bash
-route -n get <CAMERA_IP>
-sudo route -n delete -host <CAMERA_IP> 2>/dev/null || true
-sudo route -n add -host <CAMERA_IP> -interface <CAMERA_IFACE>
-sudo arp -d <CAMERA_IP> 2>/dev/null || true
+route -n get 192.168.88.1
 ```
 
-### 6) Полная диагностика в один шаг
+В выводе должен быть указан Ethernet-интерфейс камеры, а не Wi-Fi.
 
-```bash
-bash tools/baumer_network_diagnose.sh <CAMERA_IFACE>
-```
+## Запуск
 
-### 7) Только после этого запускать приложение
-
-#### GUI (основной режим)
+Обычный запуск из корня проекта:
 
 ```bash
 source .venv/bin/activate
-GST_PLUGIN_PATH=/opt/homebrew/opt/aravis/lib/gstreamer-1.0 python tools/baumer_hydra_gui.py
+export GST_PLUGIN_PATH="$(brew --prefix aravis)/lib/gstreamer-1.0"
+python tools/baumer_hydra_gui.py
 ```
 
-GUI больше не подставляет «чужие» дефолтные значения IP/interface.  
-Сначала укажите `Interface` и `Camera IP` в окне, либо нажмите `Auto Find/Fix`.
-
-#### Analysis / Classification в Hydra GUI
-
-Для работы кнопок `Анализ` и `Classification` должны быть выполнены условия:
-
-- есть live frame с камеры;
-- завершена calibration/crop настройка;
-- задана white point;
-- выбрана `Segmentation lens` от 1 до 16;
-- face segmentation model загружена;
-- HSI reconstruction precheck прошёл успешно;
-- для `Classification` дополнительно загружен `weights/face_cls_model.json`.
-
-Кнопка `Демо-режим` становится доступна только тогда, когда готов штатный
-`Classification`. При этом внутри самого демо-режима сегментация и классификация
-лица не запускаются: система только реконструирует HSI по свежему кадру, сразу
-показывает спектр случайной точки, затем выбирает ещё три точки с интервалом
-5 секунд. Через 5 секунд после четвёртой точки запускается новая HSI-реконструкция
-по свежему кадру, и цикл повторяется. Ручной выбор точки на HSI-изображении
-немедленно останавливает демо-режим и оставляет результат в обычном интерактивном
-режиме. Демо-режим также можно остановить повторным нажатием кнопки.
-
-### CLI: scientific session (1 кадр)
+Интерфейс и IP камеры можно передать сразу:
 
 ```bash
-source .venv/bin/activate
-python tools/baumer_capture_one.py \
-  --camera <CAMERA_IP> \
-  --interface <CAMERA_IFACE> \
-  --scientific-session \
-  --profile scene_capture \
-  --frames-count 1 \
-  --session-dir capture
+python tools/baumer_hydra_gui.py \
+  --interface en10 \
+  --camera 192.168.88.1 \
+  --output-dir capture
 ```
 
-### CLI: burst (например dark frames)
+Полезные параметры:
 
-```bash
-source .venv/bin/activate
-python tools/baumer_capture_one.py \
-  --camera <CAMERA_IP> \
-  --interface <CAMERA_IFACE> \
-  --scientific-session \
-  --profile dark_frame \
-  --frames-count 16 \
-  --session-dir capture
-```
+- `--packet-size 1440` — размер сетевого пакета камеры;
+- `--packet-delay 1000` — межпакетная задержка `GevSCPD`;
+- `--preview-fps 10` — частота обновления предварительного просмотра;
+- `--debug` — подробные сообщения в терминале;
+- `--no-force-u8` — не приводить входные данные к 8 битам в GUI-пайплайне.
 
-## Формат scientific output
+## Калибровка камеры
+
+После успешного подключения откроется экран выбора. Для новой калибровки
+нажмите `Calibrate Camera`. Если готовая сессия уже существует, используйте
+`Use Calibration From Existing Session` и выберите её каталог в `capture/`.
+
+Перед началом можно указать файл `Wavelength Mapping`. Ожидается 48 строк для
+16 линз и трёх цветовых каналов, например:
 
 ```text
-capture/session_YYYY-MM-DD_HH-MM-SS_xxxxxx/
-  session.json
-  frames/
-    frame_000001.npy
-    frame_000001.json
-    frame_000001_preview.png   # опционально
-  logs/
-    warnings.log               # если были warning
+crop_1_R.png: 730
+crop_1_G.png: 710
+crop_1_B.png: 690
 ```
 
-## Частые проблемы и как чинить
+### Этап 1. Границы 16 изображений (`Crop Calibration`)
 
-1. `No GVCP discovery replies`:
-- неверный интерфейс
-- интерфейс inactive/down
-- камера в другой подсети
-- проблемы кабеля/питания/линка
+1. Разместите шахматную доску 4×4 клетки так, чтобы центральное пересечение
+   внутренних углов было видно во всех 16 изображениях линз.
+2. Настройте `Gain` и `Exposure`, чтобы клетки были различимы без пересвета.
+3. Нажмите `Detect 16 Chess Centers`.
+4. Проверьте найденные центры на предварительном просмотре.
+5. При необходимости включите `Manual point drag`, перетащите ошибочные точки и
+   скорректируйте границы `Left`, `Right`, `Top`, `Bottom`.
+6. Нажмите `Save Crop And Continue`.
 
-2. `Can't connect to device at address ...`:
-- discovery видит камеру, но host-route указывает не на camera interface
-- IP камеры поменялся после reboot/forceip
+Приложение должно получить ровно 16 корректных областей. Если этап не проходит,
+улучшите освещение, резкость и положение доски, затем повторите обнаружение.
 
-3. `access-denied` при set exposure/gain:
-- контроль камеры у другого клиента (другая программа/ПК)
-- reconnect в GUI обычно снимает проблему
+### Этап 2. Плоское поле (`Flat Field Calibration`)
 
-4. Низкий FPS preview:
-- большой `GevSCPD`
-- ограничения сети 1GbE при большом payload
-- слишком высокая частота preview render
+1. Полностью заполните поле зрения равномерной яркой поверхностью, желательно
+   Spectralon.
+2. Не меняйте геометрию камеры во время серии.
+3. Укажите число кадров `Burst frames`. Значение по умолчанию — 8.
+4. Оставьте `Low-pass sigma` по умолчанию, если нет измеренного основания его
+   менять.
+5. Нажмите `Create Flat Map` и дождитесь перехода к следующему этапу.
 
-Подробный сетевой гайд: [docs/macos-network-setup.md](docs/macos-network-setup.md)
+Кнопка `Skip Flat Field Calibration` отключает коррекцию плоского поля. Это
+допустимо для проверки интерфейса, но снижает качество количественных данных.
 
-## Примечания
+### Этап 3. Геометрия (`Geometry Calibration`)
 
-- Приоритет проекта: корректный RAW scientific capture, а не «красивый» preview.
-- Packed 10/12-bit форматы пока intentionally не декодируются в scientific pipeline.
+1. Снова установите шахматную доску 4×4 клетки так, чтобы сетка 3×3 внутренних
+   углов была видна на всех 16 линзах.
+2. Оставьте `Inner corners` равным `3 × 3`.
+3. По умолчанию требуется 5 принятых кадров (`Valid frames target`). Между
+   кадрами немного перемещайте или наклоняйте доску, сохраняя её видимость.
+4. Нажмите `Capture chess frame`.
+5. Просмотрите найденные углы на всех линзах. Нажмите `Accept detection`, если
+   они корректны, либо `Refuse / recapture` и снимите кадр заново.
+6. После принятия последнего кадра дождитесь расчёта гомографий. Приложение
+   автоматически перейдёт в главное окно.
+
+`Skip Geometry Calibration` отключает геометрическое совмещение. Используйте
+его только для диагностики или если совмещение заведомо не требуется.
+
+### Этап 4. Точка белого в главном окне
+
+Точка белого сохраняется в текущую калибровочную сессию и необходима для
+анализа, классификации и демо-режима.
+
+1. Установите равномерную белую мишень.
+2. Переключитесь в `Single Lens` и выберите линзу.
+3. Нажмите `Задать точку белого`.
+4. Выделите мышью однородную область без теней, бликов и пересвета.
+5. Проверьте, что в статусе появилось подтверждение сохранения white point.
+
+## Результаты калибровки
+
+Новая сессия создаётся автоматически:
+
+```text
+capture/session_ГГГГ-ММ-ДД_ЧЧ-ММ-СС_..._calibration/
+  crop.json
+  flat_calibration.json
+  flat_norm.npy
+  geometry_calibration.json
+  H_lens.npy
+  wavelength_mapping.json
+  white_point.json
+  white_point_reference.npy
+```
+
+Часть файлов отсутствует, если соответствующий этап был пропущен. Для повторной
+работы загружайте каталог сессии целиком, не отдельные файлы.
+
+## Анализ, классификация и демо-режим
+
+Для анализа необходимы live-кадр, корректная калибровка, точка белого,
+HSI-реконструкция и загруженная модель сегментации. Для `Classification`
+дополнительно нужен `weights/face_cls_model.json`.
+
+`Демо-режим` доступен при готовом `Classification`, но внутри демо не запускает
+сегментацию и классификацию лица. Он реконструирует HSI, показывает четыре
+случайные точки со спектрами через каждые 5 секунд и затем реконструирует новый
+кадр. Ручной выбор точки или повторное нажатие кнопки останавливает цикл.
+
+## Типичные проблемы
+
+### Камера не найдена
+
+- убедитесь, что `ifconfig` показывает `status: active`;
+- проверьте, что интерфейс имеет IPv4-адрес;
+- отключите VPN и второй клиент, который может удерживать камеру;
+- убедитесь, что IP камеры отличается от IP компьютера;
+- проверьте маршрут командой `route -n get <IP_КАМЕРЫ>`.
+
+### `gi` или `Aravis` не импортируется
+
+Проверьте Homebrew-пакеты и параметр `include-system-site-packages` виртуального
+окружения. Запускайте приложение тем же Python, которым выполнялась проверка
+окружения.
+
+### HSI-реконструкция недоступна
+
+Проверьте наличие `weights/config.yaml` и `weights/weights.ckpt`. Включите
+`--debug`, чтобы увидеть причину запуска worker-процесса.
+
+### Низкая частота кадров или повреждённые кадры
+
+- оставьте `--packet-size 1440` для сети с MTU 1500;
+- увеличьте `--packet-delay` при потерях пакетов;
+- используйте отдельный гигабитный Ethernet-интерфейс и исправный кабель;
+- уменьшите `--preview-fps`, если интерфейс компьютера перегружен.
