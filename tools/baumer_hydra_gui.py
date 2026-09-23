@@ -15,12 +15,14 @@ Workflow:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import fcntl
 import json
 import math
 import os
 import queue
+import random
 import re
 import select
 import shutil
@@ -43,6 +45,8 @@ DEFAULT_PACKET_SIZE = 1440
 DEFAULT_PACKET_DELAY = 1000
 DEFAULT_UI_POLL_MS = 10
 DEFAULT_PREVIEW_FPS = 10.0
+DEMO_POINT_COUNT = 7
+DEMO_POINT_INTERVAL_MS = 3000
 
 # Avoid OpenCV OpenCL/Metal runtime crashes on macOS during chessboard detection.
 os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
@@ -1014,6 +1018,7 @@ class HydraWizardApp(tk.Tk):
         self.face_seg_status_var = tk.StringVar(value="Face segmentation: model is not loaded")
         self.analyze_button_var = tk.StringVar(value="Анализ")
         self.classify_button_var = tk.StringVar(value="Classification")
+        self.demo_button_var = tk.StringVar(value="Демо-режим")
         self.white_point_button_var = tk.StringVar(value="Задать точку белого")
         self.white_point_info_var = tk.StringVar(value="White point: not set")
         self.max_fps_var = tk.StringVar(value="Max FPS: -")
@@ -1102,6 +1107,10 @@ class HydraWizardApp(tk.Tk):
         self._analysis_fas_is_live: bool | None = None
         self._analysis_image_width = 0
         self._analysis_rotation_quarters = 0
+        self._demo_active = False
+        self._demo_after_id: str | None = None
+        self._demo_points_shown = 0
+        self._demo_used_points: set[tuple[int, int]] = set()
         self.analysis_smooth_enabled_var = tk.BooleanVar(value=False)
         self.analysis_smooth_sigma_var = tk.DoubleVar(value=1.2)
         self.analysis_smooth_window_var = tk.IntVar(value=5)
@@ -1129,6 +1138,7 @@ class HydraWizardApp(tk.Tk):
         self.geometry_h: "np.ndarray | None" = None
         self.geometry_correction_enabled = True
         self.reference_lens = 0
+        self._geometry_review: dict[str, object] | None = None
         self.wavelength_mapping_entries: list[dict[str, object]] = []
         self.wavelength_mapping_source: str | None = None
 
@@ -1311,14 +1321,16 @@ class HydraWizardApp(tk.Tk):
         self.analyze_btn_live.grid(row=0, column=1, sticky="ew", padx=(1, 0))
         self.classify_btn = ttk.Button(side, textvariable=self.classify_button_var, command=self._start_classification)
         self.classify_btn.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 2))
+        self.demo_btn = ttk.Button(side, textvariable=self.demo_button_var, command=self._toggle_demo_mode)
+        self.demo_btn.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 2))
         self.close_analysis_btn = ttk.Button(side, text="Закрыть", command=self._close_analysis_mode)
-        self.close_analysis_btn.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 2))
+        self.close_analysis_btn.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 2))
         self.close_analysis_btn.state(["disabled"])
         self.analysis_rotate_btn = ttk.Button(side, text="Повернуть 90°", command=self._rotate_analysis_90)
-        self.analysis_rotate_btn.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 2))
+        self.analysis_rotate_btn.grid(row=9, column=0, sticky="ew", padx=8, pady=(0, 2))
         self.analysis_rotate_btn.state(["disabled"])
         smooth = ttk.LabelFrame(side, text="Spectrum Smoothing")
-        smooth.grid(row=9, column=0, sticky="ew", padx=8, pady=(2, 4))
+        smooth.grid(row=10, column=0, sticky="ew", padx=8, pady=(2, 4))
         smooth.columnconfigure(1, weight=1)
         ttk.Checkbutton(
             smooth,
@@ -1343,30 +1355,30 @@ class HydraWizardApp(tk.Tk):
         self.analysis_window_entry.bind("<Return>", self._on_analysis_plot_controls_changed)
         self.analysis_window_entry.bind("<FocusOut>", self._on_analysis_plot_controls_changed)
         ttk.Label(side, textvariable=self.face_seg_status_var, wraplength=260, justify="left").grid(
-            row=10, column=0, sticky="w", padx=8, pady=(0, 6)
+            row=11, column=0, sticky="w", padx=8, pady=(0, 6)
         )
-        ttk.Separator(side).grid(row=11, column=0, sticky="ew", padx=8, pady=(2, 6))
-        ttk.Label(side, text="Live Camera Controls", font=("Helvetica", 10, "bold")).grid(row=12, column=0, sticky="w", padx=8, pady=(0, 2))
-        self._build_main_gain_exposure_controls(side, row_start=13)
+        ttk.Separator(side).grid(row=12, column=0, sticky="ew", padx=8, pady=(2, 6))
+        ttk.Label(side, text="Live Camera Controls", font=("Helvetica", 10, "bold")).grid(row=13, column=0, sticky="w", padx=8, pady=(0, 2))
+        self._build_main_gain_exposure_controls(side, row_start=14)
 
-        self._build_zaber_controls(side, row_start=17)
+        self._build_zaber_controls(side, row_start=18)
 
         ttk.Button(side, textvariable=self.white_point_button_var, command=self._toggle_white_point_pick).grid(
-            row=23, column=0, sticky="ew", padx=8, pady=(6, 4)
+            row=24, column=0, sticky="ew", padx=8, pady=(6, 4)
         )
         ttk.Label(side, textvariable=self.white_point_info_var, wraplength=260, justify="left").grid(
-            row=24, column=0, sticky="w", padx=8, pady=(0, 6)
+            row=25, column=0, sticky="w", padx=8, pady=(0, 6)
         )
         ttk.Label(
             side,
             text="Snapshot uses current live Gain/Exposure.",
             wraplength=260,
             justify="left",
-        ).grid(row=25, column=0, sticky="w", padx=8, pady=(2, 6))
-        ttk.Button(side, text="Snapshot", command=self._snapshot).grid(row=26, column=0, sticky="ew", padx=8, pady=(6, 4))
-        ttk.Button(side, text="Back To Choice", command=lambda: self._show_page("choice")).grid(row=27, column=0, sticky="ew", padx=8, pady=4)
-        ttk.Button(side, text="Disconnect", command=self._disconnect).grid(row=28, column=0, sticky="ew", padx=8, pady=4)
-        ttk.Label(side, textvariable=self.status_var, wraplength=260, justify="left").grid(row=29, column=0, sticky="w", padx=8, pady=(10, 8))
+        ).grid(row=26, column=0, sticky="w", padx=8, pady=(2, 6))
+        ttk.Button(side, text="Snapshot", command=self._snapshot).grid(row=27, column=0, sticky="ew", padx=8, pady=(6, 4))
+        ttk.Button(side, text="Back To Choice", command=lambda: self._show_page("choice")).grid(row=28, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Button(side, text="Disconnect", command=self._disconnect).grid(row=29, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Label(side, textvariable=self.status_var, wraplength=260, justify="left").grid(row=30, column=0, sticky="w", padx=8, pady=(10, 8))
 
     def _build_zaber_controls(self, parent: ttk.Frame, row_start: int) -> None:
         self.zaber_toggle_btn = ttk.Button(parent, text="Zaber Motion ▸", command=self._toggle_zaber_panel)
@@ -1499,7 +1511,9 @@ class HydraWizardApp(tk.Tk):
         f.columnconfigure(0, weight=1)
         ttk.Label(
             f,
-            text="Chessboard 4x4 cells => 3x3 inner corners.\nCapture 5 valid frames with board on all 16 lenses.",
+            text="Chessboard 4x4 cells => 3x3 inner corners.\n"
+            "Capture a frame with the board on all 16 lenses,\n"
+            "review detected corners on Live Preview, then Accept or Refuse.",
             wraplength=250,
             justify="left",
         ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 8))
@@ -1514,18 +1528,29 @@ class HydraWizardApp(tk.Tk):
         ttk.Label(row_n, text="Valid frames target").pack(side=tk.LEFT)
         ttk.Entry(row_n, textvariable=self.geometry_target_var, width=6).pack(side=tk.LEFT, padx=(8, 0))
         self.geometry_btn_var = tk.StringVar(value="Capture chess frame 1/5")
-        ttk.Button(f, textvariable=self.geometry_btn_var, command=self._capture_geometry_frame).grid(
-            row=3, column=0, sticky="ew", padx=8, pady=(8, 4)
+        self.geometry_capture_btn = ttk.Button(f, textvariable=self.geometry_btn_var, command=self._capture_geometry_frame)
+        self.geometry_capture_btn.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 4))
+        review_row = ttk.Frame(f)
+        review_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
+        review_row.columnconfigure(0, weight=1)
+        review_row.columnconfigure(1, weight=1)
+        self.geometry_accept_btn = ttk.Button(
+            review_row, text="Accept detection", command=self._accept_geometry_review, state=tk.DISABLED
         )
-        ttk.Progressbar(f, maximum=100, variable=self.geometry_progress_var).grid(row=4, column=0, sticky="ew", padx=8, pady=(6, 2))
+        self.geometry_accept_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.geometry_refuse_btn = ttk.Button(
+            review_row, text="Refuse / recapture", command=self._refuse_geometry_review, state=tk.DISABLED
+        )
+        self.geometry_refuse_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Progressbar(f, maximum=100, variable=self.geometry_progress_var).grid(row=5, column=0, sticky="ew", padx=8, pady=(6, 2))
         ttk.Label(f, textvariable=self.geometry_progress_text_var, wraplength=250, justify="left").grid(
-            row=5, column=0, sticky="w", padx=8, pady=(0, 8)
+            row=6, column=0, sticky="w", padx=8, pady=(0, 8)
         )
         ttk.Button(f, text="Load files", command=lambda: self._load_stage_files("geometry")).grid(
-            row=6, column=0, sticky="ew", padx=8, pady=(0, 8)
+            row=7, column=0, sticky="ew", padx=8, pady=(0, 8)
         )
         ttk.Button(f, text="Skip Geometry Calibration", command=self._skip_geometry_calibration).grid(
-            row=7, column=0, sticky="ew", padx=8, pady=(0, 8)
+            row=8, column=0, sticky="ew", padx=8, pady=(0, 8)
         )
 
     def _build_gain_exposure_controls(self, parent: ttk.Frame, row_start: int, allow_lock: bool) -> None:
@@ -1620,6 +1645,8 @@ class HydraWizardApp(tk.Tk):
 
     # ----------------------------- Navigation -----------------------------
     def _show_page(self, page: str) -> None:
+        if self.current_page == "main" and page != "main":
+            self._stop_demo_mode()
         self.current_page = page
         if page == "connect":
             self.geometry("900x320")
@@ -1657,6 +1684,7 @@ class HydraWizardApp(tk.Tk):
         elif stage == "geometry":
             self.calib_title_var.set("Geometry Calibration")
             self.stage_geom_frame.grid(row=0, column=0, sticky="nsew")
+            self._clear_geometry_review(reset_buttons=True)
 
     # ----------------------------- Camera connect -----------------------------
     def _on_camera_pick_selected(self, _event: tk.Event | None = None) -> None:
@@ -2165,6 +2193,7 @@ class HydraWizardApp(tk.Tk):
         self.geometry_capture_idx = 0
         self.geometry_corners = []
         self.geometry_focus_scores = []
+        self._clear_geometry_review(reset_buttons=True)
         self.geometry_progress_var.set(0.0)
         self.geometry_progress_text_var.set("")
         self.dark_map = None
@@ -2695,89 +2724,207 @@ class HydraWizardApp(tk.Tk):
         return float(max_loc[0]), float(max_loc[1]), float(max_v)
 
     def _find_chessboard_corners_crop(self, roi_u8: "np.ndarray", cols: int, rows: int) -> "np.ndarray | None":
-        # Crop-stage detector: tuned for 16 boards in one full frame (one board per lens ROI).
-        # This path intentionally does NOT reuse geometry detector to avoid cross-stage coupling.
+        # Crop-stage detector: fast multi-try path for 16 boards in one full frame.
+        # Isolated from geometry detector; early-exits on first accepted hit.
         if cv2 is None:
             return None
         h, w = int(roi_u8.shape[0]), int(roi_u8.shape[1])
         if h < 14 or w < 14:
             return None
 
-        candidates: list[np.ndarray] = [roi_u8]
-        try:
-            clahe_obj = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
-            clahe = clahe_obj.apply(roi_u8)
-            candidates.append(clahe)
-            blur = cv2.GaussianBlur(clahe, (0, 0), 1.0)
-            sharp = cv2.addWeighted(clahe, 1.55, blur, -0.55, 0)
-            candidates.append(sharp)
-        except Exception:
-            pass
-        candidates.extend([cv2.bitwise_not(img) for img in list(candidates)])
+        def _build_candidates(img: "np.ndarray") -> list[np.ndarray]:
+            out: list[np.ndarray] = [img]
+            try:
+                clahe_obj = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
+                clahe = clahe_obj.apply(img)
+                out.append(clahe)
+                blur = cv2.GaussianBlur(clahe, (0, 0), 1.0)
+                sharp = cv2.addWeighted(clahe, 1.55, blur, -0.55, 0)
+                out.append(sharp)
+            except Exception:
+                pass
+            out.extend([cv2.bitwise_not(x) for x in list(out)])
+            return out
+
+        def _flag_sets() -> list[int]:
+            f0 = int(getattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 0)) | int(getattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 0))
+            f1 = f0 | int(getattr(cv2, "CALIB_CB_FILTER_QUADS", 0))
+            return [f0, f1]
+
+        def _accept(pts: "np.ndarray", ow: int, oh: int) -> bool:
+            cidx = (rows // 2) * cols + (cols // 2)
+            cx = float(pts[cidx, 0])
+            cy = float(pts[cidx, 1])
+            if cx < 0.10 * ow or cx > 0.90 * ow or cy < 0.10 * oh or cy > 0.90 * oh:
+                return False
+            spread = float(np.mean(np.linalg.norm(pts - pts[cidx], axis=1)))
+            return spread >= 2.0
+
+        sub_rois: list[tuple["np.ndarray", int, int, int, int]] = []
+        cx0 = int(round(w * 0.10))
+        cy0 = int(round(h * 0.10))
+        cx1 = int(round(w * 0.90))
+        cy1 = int(round(h * 0.90))
+        if (cx1 - cx0) >= 16 and (cy1 - cy0) >= 16:
+            sub_rois.append((roi_u8[cy0:cy1, cx0:cx1], cx0, cy0, cx1 - cx0, cy1 - cy0))
+        sub_rois.append((roi_u8, 0, 0, w, h))
 
         scales: list[float] = [1.0]
-        if min(h, w) < 260:
+        min_side = min(h, w)
+        if min_side < 400:
+            scales.append(1.5)
+        if min_side < 280:
             scales.append(2.0)
 
-        best: np.ndarray | None = None
-        best_score = -1e9
-        for sc in scales:
-            for img in candidates:
-                if abs(sc - 1.0) > 1e-6:
-                    ww = max(8, int(round(w * sc)))
-                    hh = max(8, int(round(h * sc)))
-                    probe = cv2.resize(img, (ww, hh), interpolation=cv2.INTER_LINEAR)
-                    scale_back = 1.0 / sc
-                else:
-                    probe = img
-                    scale_back = 1.0
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 35, 0.001)
+        flags_list = _flag_sets()
 
-                flags = int(getattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 0))
-                flags |= int(getattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 0))
-                flags |= int(getattr(cv2, "CALIB_CB_FILTER_QUADS", 0))
-                try:
-                    found, corners = cv2.findChessboardCorners(probe, (cols, rows), flags)
-                except Exception:
-                    found, corners = (False, None)
-                if not found or corners is None or int(corners.shape[0]) != (cols * rows):
+        for sub, ox, oy, sw, sh in sub_rois:
+            for img in _build_candidates(sub):
+                for sc in scales:
+                    if abs(sc - 1.0) > 1e-6:
+                        ww = max(8, int(round(sw * sc)))
+                        hh = max(8, int(round(sh * sc)))
+                        probe = cv2.resize(img, (ww, hh), interpolation=cv2.INTER_LINEAR)
+                        scale_back = 1.0 / sc
+                    else:
+                        probe = img
+                        scale_back = 1.0
+                    for flags in flags_list:
+                        try:
+                            found, corners = cv2.findChessboardCorners(probe, (cols, rows), flags)
+                        except Exception:
+                            found, corners = (False, None)
+                        if not found or corners is None or int(corners.shape[0]) != (cols * rows):
+                            continue
+                        try:
+                            corners = cv2.cornerSubPix(probe, corners, (5, 5), (-1, -1), crit)
+                        except Exception:
+                            pass
+                        pts = corners.reshape(-1, 2).astype(np.float32)
+                        if abs(scale_back - 1.0) > 1e-6:
+                            pts *= float(scale_back)
+                        pts[:, 0] += float(ox)
+                        pts[:, 1] += float(oy)
+                        if _accept(pts, w, h):
+                            return pts
+        return None
+
+    def _detect_chess_center_saddle(self, roi_u8: "np.ndarray") -> tuple[float, float, float] | None:
+        # Fallback when classic 3x3 lock fails: fit a 3x3 lattice of strong corners and take the middle node.
+        if cv2 is None or np is None:
+            return None
+        h, w = int(roi_u8.shape[0]), int(roi_u8.shape[1])
+        if h < 24 or w < 24:
+            return None
+
+        x0 = int(round(w * 0.12))
+        y0 = int(round(h * 0.12))
+        x1 = int(round(w * 0.88))
+        y1 = int(round(h * 0.88))
+        if (x1 - x0) < 20 or (y1 - y0) < 20:
+            return None
+        patch = roi_u8[y0:y1, x0:x1]
+        ph, pw = int(patch.shape[0]), int(patch.shape[1])
+        try:
+            blur = cv2.GaussianBlur(patch, (0, 0), 1.0)
+            corners = cv2.goodFeaturesToTrack(
+                blur,
+                maxCorners=48,
+                qualityLevel=0.04,
+                minDistance=max(3.0, 0.04 * float(min(ph, pw))),
+                blockSize=5,
+                useHarrisDetector=True,
+                k=0.04,
+            )
+        except Exception:
+            return None
+        if corners is None or len(corners) < 9:
+            return None
+
+        pts = corners.reshape(-1, 2).astype(np.float32)
+        try:
+            pts = cv2.cornerSubPix(
+                blur,
+                pts.reshape(-1, 1, 2),
+                (5, 5),
+                (-1, -1),
+                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01),
+            ).reshape(-1, 2)
+        except Exception:
+            pass
+
+        # Seed spacing from pairwise distances near the expected cell size.
+        n = int(pts.shape[0])
+        dists: list[float] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = float(np.hypot(float(pts[i, 0] - pts[j, 0]), float(pts[i, 1] - pts[j, 1])))
+                if d >= 4.0:
+                    dists.append(d)
+        if len(dists) < 8:
+            return None
+        dists_arr = np.asarray(dists, dtype=np.float32)
+        med = float(np.median(dists_arr))
+        # Prefer nearest-neighbor scale (cell pitch of 3x3 inner corners).
+        nn = dists_arr[(dists_arr > 0.35 * med) & (dists_arr < 0.85 * med)]
+        pitch = float(np.median(nn)) if nn.size >= 4 else float(np.percentile(dists_arr, 20.0))
+        if pitch < 4.0 or pitch > 0.55 * float(min(ph, pw)):
+            return None
+
+        cx0 = 0.5 * float(pw)
+        cy0 = 0.5 * float(ph)
+        # Search a small offset around ROI center for the lattice origin.
+        best: tuple[float, float, float, float] | None = None  # score, cx, cy, residual
+        for dy in (-0.5 * pitch, 0.0, 0.5 * pitch):
+            for dx in (-0.5 * pitch, 0.0, 0.5 * pitch):
+                ox = cx0 + float(dx)
+                oy = cy0 + float(dy)
+                nodes = []
+                residual = 0.0
+                matched = 0
+                for rr in (-1, 0, 1):
+                    for cc in (-1, 0, 1):
+                        tx = ox + float(cc) * pitch
+                        ty = oy + float(rr) * pitch
+                        d2 = (pts[:, 0] - tx) ** 2 + (pts[:, 1] - ty) ** 2
+                        j = int(np.argmin(d2))
+                        dist = float(math.sqrt(float(d2[j])))
+                        if dist > 0.40 * pitch:
+                            nodes.append((tx, ty))
+                            residual += dist
+                            continue
+                        nodes.append((float(pts[j, 0]), float(pts[j, 1])))
+                        residual += dist
+                        matched += 1
+                if matched < 7:
                     continue
-
-                crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 35, 0.001)
-                try:
-                    corners = cv2.cornerSubPix(probe, corners, (5, 5), (-1, -1), crit)
-                except Exception:
-                    pass
-                pts = corners.reshape(-1, 2).astype(np.float32)
-                if abs(scale_back - 1.0) > 1e-6:
-                    pts *= float(scale_back)
-
-                cidx = (rows // 2) * cols + (cols // 2)
-                cx = float(pts[cidx, 0])
-                cy = float(pts[cidx, 1])
-                # Crop-stage prior: board center should stay reasonably central in each lens ROI.
-                if cx < 0.10 * w or cx > 0.90 * w or cy < 0.10 * h or cy > 0.90 * h:
+                mean_res = residual / 9.0
+                score = float(matched) - 0.15 * mean_res
+                gx = float(nodes[4][0])
+                gy = float(nodes[4][1])
+                if gx < 0.08 * pw or gx > 0.92 * pw or gy < 0.08 * ph or gy > 0.92 * ph:
                     continue
-                spread = float(np.mean(np.linalg.norm(pts - pts[cidx], axis=1)))
-                dx = cx - 0.5 * w
-                dy = cy - 0.5 * h
-                score = spread - 0.010 * float(dx * dx + dy * dy)
-                if score > best_score:
-                    best_score = score
-                    best = pts
-        return best
+                if best is None or score > best[0]:
+                    best = (score, gx, gy, mean_res)
+        if best is None:
+            return None
+        _score, gx, gy, mean_res = best
+        conf = max(1.0, pitch - mean_res)
+        return (float(x0 + gx), float(y0 + gy), float(conf))
 
     def _detect_chess_center_in_roi(self, roi_u8: "np.ndarray") -> tuple[float, float, float] | None:
         # 4x4 chessboard cells => 3x3 inner corners, center is index 4.
         cols = 3
         rows = 3
         corners = self._find_chessboard_corners_crop(roi_u8, cols, rows)
-        if corners is None or corners.shape[0] != (cols * rows):
-            return None
-        cidx = (rows // 2) * cols + (cols // 2)
-        cx = float(corners[cidx, 0])
-        cy = float(corners[cidx, 1])
-        spread = float(np.mean(np.linalg.norm(corners - corners[cidx], axis=1)))
-        return (cx, cy, spread)
+        if corners is not None and corners.shape[0] == (cols * rows):
+            cidx = (rows // 2) * cols + (cols // 2)
+            cx = float(corners[cidx, 0])
+            cy = float(corners[cidx, 1])
+            spread = float(np.mean(np.linalg.norm(corners - corners[cidx], axis=1)))
+            return (cx, cy, spread)
+        return self._detect_chess_center_saddle(roi_u8)
 
     def _fit_center_grid_from_found(self, found: dict[int, tuple[float, float, float]]) -> dict[int, tuple[float, float, float]]:
         # Model center positions as bilinear function of (row, col) on the 4x4 lens lattice.
@@ -2812,28 +2959,29 @@ class HydraWizardApp(tk.Tk):
             out[idx] = (vx, vy, 0.0)
         return out
 
-    def _refine_center_near_hint(self, roi_u8: "np.ndarray", x_hint: float, y_hint: float, radius: int = 26) -> tuple[float, float, float]:
+    def _refine_center_near_hint(self, roi_u8: "np.ndarray", x_hint: float, y_hint: float, radius: int = 26) -> tuple[float, float, float] | None:
         if cv2 is None:
-            return x_hint, y_hint, 0.0
+            return None
         h, w = int(roi_u8.shape[0]), int(roi_u8.shape[1])
         if h <= 4 or w <= 4:
-            return x_hint, y_hint, 0.0
+            return None
+        rad = int(max(48, min(radius, min(h, w) // 2)))
         xh = int(max(0, min(w - 1, round(float(x_hint)))))
         yh = int(max(0, min(h - 1, round(float(y_hint)))))
-        x0 = max(0, xh - radius)
-        y0 = max(0, yh - radius)
-        x1 = min(w, xh + radius + 1)
-        y1 = min(h, yh + radius + 1)
+        x0 = max(0, xh - rad)
+        y0 = max(0, yh - rad)
+        x1 = min(w, xh + rad + 1)
+        y1 = min(h, yh + rad + 1)
         if x1 <= x0 + 2 or y1 <= y0 + 2:
-            return float(xh), float(yh), 0.0
+            return None
         patch = roi_u8[y0:y1, x0:x1]
-        # Prefer true chess center via local robust call around hint.
         got = self._detect_chess_center_in_roi(patch)
-        if got is not None:
-            gx, gy, conf = got
-            return float(x0 + gx), float(y0 + gy), float(conf)
-        # If local chessboard lock failed, keep geometric hint (avoid drifting to unrelated bright structures).
-        return float(xh), float(yh), 0.0
+        if got is None:
+            return None
+        gx, gy, conf = got
+        if float(conf) <= 0.0:
+            return None
+        return float(x0 + gx), float(y0 + gy), float(conf)
 
     def _detect_crop_points(self) -> None:
         if cv2 is None:
@@ -2850,32 +2998,46 @@ class HydraWizardApp(tk.Tk):
         min_len_y = max(30, h // 20)
         col_bands = self._find_bands_from_profile(gray_det.mean(axis=0), expected=4, min_len=min_len_x)
         row_bands = self._find_bands_from_profile(gray_det.mean(axis=1), expected=4, min_len=min_len_y)
-        pts: list[tuple[float, float, float]] = []
+
         roi_boxes: list[tuple[int, int, int, int]] = []
-        found_map: dict[int, tuple[float, float, float]] = {}
-        missing: list[int] = []
-        lens_idx = 0
-        for r, (y0, y1) in enumerate(row_bands):
-            for c, (x0, x1) in enumerate(col_bands):
+        rois: list["np.ndarray"] = []
+        for _r, (y0, y1) in enumerate(row_bands):
+            for _c, (x0, x1) in enumerate(col_bands):
                 x0c = max(0, min(w - 1, int(x0)))
                 x1c = max(x0c + 1, min(w, int(x1)))
                 y0c = max(0, min(h - 1, int(y0)))
                 y1c = max(y0c + 1, min(h, int(y1)))
                 roi_boxes.append((x0c, y0c, x1c, y1c))
-                roi = gray_det[y0c:y1c, x0c:x1c]
-                got_center = self._detect_chess_center_in_roi(roi)
-                if got_center is None:
-                    missing.append(lens_idx + 1)
-                    # Fallback keeps array shape consistent, but user is warned and save is blocked.
-                    px, py, conf = self._detect_peak_in_roi(roi)
-                    pts.append((x0c + px, y0c + py, conf))
-                else:
-                    px, py, conf = got_center
-                    gx = x0c + px
-                    gy = y0c + py
-                    pts.append((gx, gy, conf))
-                    found_map[lens_idx] = (gx, gy, conf)
-                lens_idx += 1
+                rois.append(gray_det[y0c:y1c, x0c:x1c])
+
+        def _detect_one(idx: int) -> tuple[int, tuple[float, float, float] | None]:
+            return idx, self._detect_chess_center_in_roi(rois[idx])
+
+        results: list[tuple[float, float, float] | None] = [None] * len(rois)
+        workers = min(16, max(1, len(rois)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_detect_one, i) for i in range(len(rois))]
+            for fut in concurrent.futures.as_completed(futures):
+                idx, got_center = fut.result()
+                results[idx] = got_center
+
+        pts: list[tuple[float, float, float]] = []
+        found_map: dict[int, tuple[float, float, float]] = {}
+        missing: list[int] = []
+        for lens_idx, (box, got_center) in enumerate(zip(roi_boxes, results)):
+            x0c, y0c, x1c, y1c = box
+            roi = rois[lens_idx]
+            if got_center is None:
+                missing.append(lens_idx + 1)
+                px, py, conf = self._detect_peak_in_roi(roi)
+                pts.append((x0c + px, y0c + py, conf))
+            else:
+                px, py, conf = got_center
+                gx = x0c + px
+                gy = y0c + py
+                pts.append((gx, gy, conf))
+                found_map[lens_idx] = (gx, gy, conf)
+
         if self.debug:
             confs = np.asarray([p[2] for p in pts], dtype=np.float32)
             self._dbg(
@@ -2886,7 +3048,7 @@ class HydraWizardApp(tk.Tk):
         if len(pts) != 16:
             self.status_var.set(f"Internal detection error: got {len(pts)} points instead of 16")
             return
-        # Recovery pass: estimate missing centers from 4x4 lattice + local ROI refinement.
+
         recovered_count = 0
         if missing:
             preds = self._fit_center_grid_from_found(found_map)
@@ -2901,11 +3063,17 @@ class HydraWizardApp(tk.Tk):
                     continue
                 x0c, y0c, x1c, y1c = roi_boxes[midx]
                 roi = gray_det[y0c:y1c, x0c:x1c]
+                rw = max(1, x1c - x0c)
+                rh = max(1, y1c - y0c)
+                radius = max(48, int(0.35 * float(min(rw, rh))))
                 px_hint = float(preds[midx][0] - x0c)
                 py_hint = float(preds[midx][1] - y0c)
-                px_hint = max(0.0, min(float(x1c - x0c - 1), px_hint))
-                py_hint = max(0.0, min(float(y1c - y0c - 1), py_hint))
-                px, py, conf = self._refine_center_near_hint(roi, px_hint, py_hint, radius=28)
+                px_hint = max(0.0, min(float(rw - 1), px_hint))
+                py_hint = max(0.0, min(float(rh - 1), py_hint))
+                refined = self._refine_center_near_hint(roi, px_hint, py_hint, radius=radius)
+                if refined is None:
+                    continue
+                px, py, conf = refined
                 gx = float(x0c + px)
                 gy = float(y0c + py)
                 pts[midx] = (gx, gy, conf)
@@ -3217,12 +3385,79 @@ class HydraWizardApp(tk.Tk):
         self.status_var.set("Flat field calibration skipped. Proceed to geometry calibration.")
 
     # ----------------------------- Geometry stage -----------------------------
+    @staticmethod
+    def _chessboard_corners_structurally_ok(
+        pts: "np.ndarray",
+        cols: int,
+        rows: int,
+        img_w: int,
+        img_h: int,
+    ) -> bool:
+        # Reject collapsed / irregular OpenCV false positives common on soft 3x3 boards.
+        if np is None:
+            return False
+        arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        if arr.shape[0] != int(cols * rows):
+            return False
+        if img_w < 16 or img_h < 16:
+            return False
+        grid = arr.reshape(int(rows), int(cols), 2)
+        hx = np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=2)
+        hy = np.linalg.norm(grid[1:, :, :] - grid[:-1, :, :], axis=2)
+        if hx.size == 0 or hy.size == 0:
+            return False
+        med_h = float(np.median(hx))
+        med_v = float(np.median(hy))
+        min_pitch = max(10.0, 0.045 * float(min(img_w, img_h)))
+        max_pitch = 0.62 * float(min(img_w, img_h))
+        if med_h < min_pitch or med_v < min_pitch:
+            return False
+        if med_h > max_pitch or med_v > max_pitch:
+            return False
+        if float(np.min(hx)) < 0.45 * med_h or float(np.max(hx)) > 1.85 * med_h:
+            return False
+        if float(np.min(hy)) < 0.45 * med_v or float(np.max(hy)) > 1.85 * med_v:
+            return False
+        aspect = med_h / max(1e-6, med_v)
+        if aspect < 0.40 or aspect > 2.5:
+            return False
+        # Outer quad should be roughly convex and cover a meaningful area.
+        tl, tr = grid[0, 0], grid[0, -1]
+        bl, br = grid[-1, 0], grid[-1, -1]
+        area = 0.5 * abs(
+            float(tl[0] * tr[1] + tr[0] * br[1] + br[0] * bl[1] + bl[0] * tl[1])
+            - float(tl[1] * tr[0] + tr[1] * br[0] + br[1] * bl[0] + bl[1] * tl[0])
+        )
+        if area < 0.012 * float(img_w * img_h):
+            return False
+        cx = float(np.mean(arr[:, 0]))
+        cy = float(np.mean(arr[:, 1]))
+        if cx < 0.05 * img_w or cx > 0.95 * img_w or cy < 0.05 * img_h or cy > 0.95 * img_h:
+            return False
+        # Row/col directions should stay roughly axis-aligned within the crop.
+        row_vec = tr - tl
+        col_vec = bl - tl
+        if abs(float(row_vec[0])) < 1e-3 and abs(float(row_vec[1])) < 1e-3:
+            return False
+        if abs(float(col_vec[0])) < 1e-3 and abs(float(col_vec[1])) < 1e-3:
+            return False
+        row_ang = abs(math.atan2(float(row_vec[1]), float(row_vec[0])))
+        col_ang = abs(math.atan2(float(col_vec[1]), float(col_vec[0])))
+        # row ~ horizontal, col ~ vertical (allow soft perspective)
+        if min(row_ang, abs(math.pi - row_ang)) > math.radians(38.0):
+            return False
+        if min(abs(col_ang - 0.5 * math.pi), abs(col_ang - 1.5 * math.pi)) > math.radians(38.0):
+            return False
+        return True
+
     def _find_chessboard_corners_robust(
         self,
         u8: "np.ndarray",
         cols: int,
         rows: int,
         progress_cb=None,
+        roi_hint: tuple[int, int, int, int] | None = None,
+        fast: bool = False,
     ) -> tuple["np.ndarray | None", str]:
         if cv2 is None:
             return None, "opencv_unavailable"
@@ -3231,8 +3466,18 @@ class HydraWizardApp(tk.Tk):
             return None, "too_small"
 
         def _roi_candidates(img_u8: "np.ndarray") -> list[tuple["np.ndarray", int, int]]:
-            rois: list[tuple["np.ndarray", int, int]] = [(img_u8, 0, 0)]
             hh, ww = int(img_u8.shape[0]), int(img_u8.shape[1])
+            if roi_hint is not None:
+                x0, y0, x1, y1 = [int(v) for v in roi_hint]
+                x0 = max(0, min(ww - 1, x0))
+                y0 = max(0, min(hh - 1, y0))
+                x1 = max(x0 + 1, min(ww, x1))
+                y1 = max(y0 + 1, min(hh, y1))
+                if (x1 - x0) >= 14 and (y1 - y0) >= 14:
+                    return [(img_u8[y0:y1, x0:x1], x0, y0)]
+                return [(img_u8, 0, 0)]
+
+            rois: list[tuple["np.ndarray", int, int]] = [(img_u8, 0, 0)]
             if hh < 20 or ww < 20:
                 return rois
             # Geometry-stage prior: board is usually near the lens center.
@@ -3245,6 +3490,8 @@ class HydraWizardApp(tk.Tk):
                     rois.append((img_u8[cy0:cy1, cx0:cx1], cx0, cy0))
             except Exception:
                 pass
+            if fast:
+                return rois
             try:
                 blur = cv2.GaussianBlur(img_u8, (5, 5), 0.0)
                 p = float(np.percentile(blur, 62.0))
@@ -3340,6 +3587,8 @@ class HydraWizardApp(tk.Tk):
             if ox or oy:
                 out[:, 0] += float(ox)
                 out[:, 1] += float(oy)
+            if not HydraWizardApp._chessboard_corners_structurally_ok(out, cols, rows, w, h):
+                return None, f"{method_prefix}:bad_geometry"
             return out, f"{method_prefix}:{detector_used}"
 
         # Candidate inputs: raw, equalized, sharpened, inverted variants.
@@ -3349,10 +3598,6 @@ class HydraWizardApp(tk.Tk):
         clahe = None
         sharp = None
         sharp2 = None
-        adapt = None
-        adapt_inv = None
-        otsu = None
-        otsu_inv = None
         try:
             norm = cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             eq = cv2.equalizeHist(base)
@@ -3360,61 +3605,61 @@ class HydraWizardApp(tk.Tk):
             clahe = clahe_obj.apply(base)
             blur = cv2.GaussianBlur(clahe, (0, 0), 1.2)
             sharp = cv2.addWeighted(clahe, 1.6, blur, -0.6, 0)
-            blur2 = cv2.GaussianBlur(clahe, (0, 0), 2.1)
-            sharp2 = cv2.addWeighted(clahe, 1.9, blur2, -0.9, 0)
-            adapt = cv2.adaptiveThreshold(
-                clahe,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                31,
-                3,
-            )
-            adapt_inv = cv2.adaptiveThreshold(
-                clahe,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV,
-                31,
-                3,
-            )
-            _ret, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            _ret2, otsu_inv = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            if not fast:
+                blur2 = cv2.GaussianBlur(clahe, (0, 0), 2.1)
+                sharp2 = cv2.addWeighted(clahe, 1.9, blur2, -0.9, 0)
         except Exception:
             pass
-        candidates: list[tuple[str, np.ndarray]] = [("base", base)]
-        if norm is not None:
-            candidates.append(("norm", norm))
-        if eq is not None:
-            candidates.append(("eq", eq))
-        if clahe is not None:
-            candidates.append(("clahe", clahe))
-        if sharp is not None:
-            candidates.append(("sharp", sharp))
-        if sharp2 is not None:
-            candidates.append(("sharp2", sharp2))
-        if adapt is not None:
-            candidates.append(("adapt", adapt))
-        if adapt_inv is not None:
-            candidates.append(("adapt_inv", adapt_inv))
-        if otsu is not None:
-            candidates.append(("otsu", otsu))
-        if otsu_inv is not None:
-            candidates.append(("otsu_inv", otsu_inv))
-        inv_base = [(name, img) for name, img in (("base", base), ("norm", norm), ("eq", eq), ("clahe", clahe), ("sharp", sharp), ("sharp2", sharp2)) if img is not None]
-        for name, img in inv_base:
+        if fast:
+            candidates: list[tuple[str, np.ndarray]] = [("base", base)]
+            if clahe is not None:
+                candidates.append(("clahe", clahe))
+            if sharp is not None:
+                candidates.append(("sharp", sharp))
+            if norm is not None:
+                candidates.append(("norm", norm))
+        else:
+            candidates = [("base", base)]
+            if norm is not None:
+                candidates.append(("norm", norm))
+            if eq is not None:
+                candidates.append(("eq", eq))
+            if clahe is not None:
+                candidates.append(("clahe", clahe))
+            if sharp is not None:
+                candidates.append(("sharp", sharp))
+            if sharp2 is not None:
+                candidates.append(("sharp2", sharp2))
+        # Skip hard binary (adapt/otsu) candidates: on soft/blurry 3x3 boards they often
+        # produce collapsed false-positive corner sets that classic finder still accepts.
+        inv_src = list(candidates) if fast else [
+            (name, img)
+            for name, img in (("base", base), ("norm", norm), ("eq", eq), ("clahe", clahe), ("sharp", sharp), ("sharp2", sharp2))
+            if img is not None
+        ]
+        for name, img in inv_src:
             candidates.append((f"{name}_inv", cv2.bitwise_not(img)))
 
         # If board is small in ROI, upscaling often helps SB/classic detector.
         scales: list[float] = [1.0]
-        if min(h, w) < 700:
-            scales.append(1.5)
-        if min(h, w) < 520:
-            scales.append(2.0)
-        if min(h, w) < 360:
-            scales.append(2.5)
-        if min(h, w) < 320:
-            scales.append(3.0)
+        min_side = min(h, w)
+        if roi_hint is not None:
+            x0, y0, x1, y1 = [int(v) for v in roi_hint]
+            min_side = max(1, min(max(1, x1 - x0), max(1, y1 - y0)))
+        if fast:
+            if min_side < 360:
+                scales.append(1.5)
+            if min_side < 240:
+                scales.append(2.0)
+        else:
+            if min(h, w) < 700:
+                scales.append(1.5)
+            if min(h, w) < 520:
+                scales.append(2.0)
+            if min(h, w) < 360:
+                scales.append(2.5)
+            if min(h, w) < 320:
+                scales.append(3.0)
 
         for sc in scales:
             for cname, img in candidates:
@@ -3435,18 +3680,130 @@ class HydraWizardApp(tk.Tk):
                         return c, m
         return None, "no_match"
 
+    @staticmethod
+    def _board_roi_from_corners(
+        pts: "np.ndarray",
+        img_w: int,
+        img_h: int,
+        pad_ratio: float = 0.40,
+        min_pad: int = 18,
+    ) -> tuple[int, int, int, int]:
+        arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        x0 = float(np.min(arr[:, 0]))
+        x1 = float(np.max(arr[:, 0]))
+        y0 = float(np.min(arr[:, 1]))
+        y1 = float(np.max(arr[:, 1]))
+        bw = max(1.0, x1 - x0)
+        bh = max(1.0, y1 - y0)
+        pad_x = max(float(min_pad), pad_ratio * bw)
+        pad_y = max(float(min_pad), pad_ratio * bh)
+        rx0 = int(max(0, math.floor(x0 - pad_x)))
+        ry0 = int(max(0, math.floor(y0 - pad_y)))
+        rx1 = int(min(img_w, math.ceil(x1 + pad_x)))
+        ry1 = int(min(img_h, math.ceil(y1 + pad_y)))
+        if rx1 <= rx0 + 8:
+            rx1 = min(img_w, rx0 + 9)
+        if ry1 <= ry0 + 8:
+            ry1 = min(img_h, ry0 + 9)
+        return rx0, ry0, rx1, ry1
+
     def _find_chessboard_corners_geometry(
         self,
         u8: "np.ndarray",
         cols: int,
         rows: int,
         progress_cb=None,
+        roi_hint: tuple[int, int, int, int] | None = None,
+        fast: bool = False,
     ) -> tuple["np.ndarray | None", str]:
         # Geometry-stage detector: one board per already-cropped lens image.
         # Kept isolated from crop-stage detector by dedicated method.
-        return self._find_chessboard_corners_robust(u8, cols, rows, progress_cb=progress_cb)
+        return self._find_chessboard_corners_robust(
+            u8, cols, rows, progress_cb=progress_cb, roi_hint=roi_hint, fast=fast
+        )
+
+    def _geometry_lens_sources(
+        self,
+        work: "np.ndarray",
+        lenses: "np.ndarray",
+        fmt: str,
+        lens_idx: int,
+    ) -> tuple[list[tuple[str, "np.ndarray"]], float]:
+        gray_f = work[lens_idx]
+        u8 = raw_to_u8(np.clip(gray_f, 0, 65535).astype(np.uint16), fmt)
+        u8_stretch = raw_to_u8(np.clip(gray_f, 0, 65535).astype(np.uint16), fmt, autostretch=True)
+        raw_u8 = raw_to_u8(np.asarray(lenses[lens_idx]), fmt, autostretch=False)
+        raw_u8_stretch = raw_to_u8(np.asarray(lenses[lens_idx]), fmt, autostretch=True)
+        focus = 0.0
+        if cv2 is not None:
+            lap = cv2.Laplacian(u8, cv2.CV_32F)
+            focus = float(lap.var())
+        sources = [
+            ("flat_u8", u8),
+            ("flat_u8_autostretch", u8_stretch),
+            ("raw_u8", raw_u8),
+            ("raw_u8_autostretch", raw_u8_stretch),
+        ]
+        return sources, focus
+
+    def _detect_geometry_on_sources(
+        self,
+        sources: list[tuple[str, "np.ndarray"]],
+        cols: int,
+        rows: int,
+        lens_no: int,
+        *,
+        roi_hint: tuple[int, int, int, int] | None = None,
+        fast: bool = False,
+        mode_label: str = "full",
+    ) -> tuple["np.ndarray | None", str]:
+        for src_name, src_img in sources:
+            self.status_var.set(
+                f"Geometry detect: lens {lens_no}/16, mode={mode_label}, source={src_name}"
+            )
+            self.geometry_progress_text_var.set(
+                f"Lens {lens_no}/16 [{mode_label}]: source={src_name}"
+            )
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            method_ui_ts = 0.0
+
+            def _method_progress(method_name: str) -> None:
+                nonlocal method_ui_ts
+                now_ts = time.monotonic()
+                if (now_ts - method_ui_ts) < 0.12:
+                    return
+                method_ui_ts = now_ts
+                self.geometry_progress_text_var.set(
+                    f"Lens {lens_no}/16 [{mode_label}]: source={src_name}, method={method_name}"
+                )
+                try:
+                    self.update_idletasks()
+                except Exception:
+                    pass
+
+            c_try, m_try = self._find_chessboard_corners_geometry(
+                src_img,
+                cols,
+                rows,
+                progress_cb=_method_progress,
+                roi_hint=roi_hint,
+                fast=fast,
+            )
+            if c_try is None or c_try.shape[0] != cols * rows:
+                continue
+            ih, iw = int(src_img.shape[0]), int(src_img.shape[1])
+            if not self._chessboard_corners_structurally_ok(c_try, cols, rows, iw, ih):
+                if self.debug:
+                    self._dbg(f"geom lens {lens_no}: rejected bad geometry from {src_name}:{m_try}")
+                continue
+            return c_try.astype(np.float32), f"{src_name}:{m_try}"
+        return None, "none"
 
     def _skip_geometry_calibration(self) -> None:
+        self._clear_geometry_review(reset_buttons=True)
         self.geometry_h = None
         self.geometry_correction_enabled = False
         self.reference_lens = 0
@@ -3474,7 +3831,213 @@ class HydraWizardApp(tk.Tk):
         self._show_page("main")
         self.status_var.set("Geometry calibration skipped. Geometric correction disabled.")
 
+    def _compose_geometry_review_rgb(self, work: "np.ndarray", fmt_name: str) -> "np.ndarray":
+        boxes_sorted = self._sorted_crop_boxes()
+        lh = int(work.shape[1])
+        lw = int(work.shape[2])
+        rgb_lenses = np.empty((16, lh, lw, 3), dtype=np.uint8)
+        for i in range(16):
+            pattern_i = None
+            if i < len(boxes_sorted):
+                bi = boxes_sorted[i]
+                pattern_i = bayer_pattern_for_crop(fmt_name, int(bi["x"]), int(bi["y"]))
+            rgb_lenses[i] = self._preview_rgb_main_fast(
+                np.clip(work[i], 0, 65535).astype(np.uint16),
+                fmt_name,
+                autostretch=False,
+                pattern_override=pattern_i,
+            )
+        return compose_grid16_rgb(rgb_lenses, gap=2)
+
+    def _set_geometry_review_controls(self, reviewing: bool) -> None:
+        cap_state = tk.DISABLED if reviewing else tk.NORMAL
+        rev_state = tk.NORMAL if reviewing else tk.DISABLED
+        try:
+            self.geometry_capture_btn.configure(state=cap_state)
+            self.geometry_accept_btn.configure(state=rev_state)
+            self.geometry_refuse_btn.configure(state=rev_state)
+        except Exception:
+            pass
+
+    def _clear_geometry_review(self, reset_buttons: bool = False) -> None:
+        self._geometry_review = None
+        if reset_buttons:
+            self._set_geometry_review_controls(False)
+        try:
+            self.calib_canvas.delete("geom_overlay")
+        except Exception:
+            pass
+
+    def _enter_geometry_review(
+        self,
+        corners_dict: dict[int, "np.ndarray"],
+        focus_scores: "np.ndarray",
+        cols: int,
+        rows: int,
+        work: "np.ndarray",
+        fmt_name: str,
+    ) -> None:
+        gap = 2
+        lh = int(work.shape[1])
+        lw = int(work.shape[2])
+        corners_grid: dict[int, "np.ndarray"] = {}
+        for i, pts in corners_dict.items():
+            r = int(i) // 4
+            c = int(i) % 4
+            ox = float(c * (lw + gap))
+            oy = float(r * (lh + gap))
+            g = pts.astype(np.float32).copy()
+            g[:, 0] += ox
+            g[:, 1] += oy
+            corners_grid[int(i)] = g
+        try:
+            rgb = self._compose_geometry_review_rgb(work, fmt_name)
+        except Exception:
+            rgb = None
+        self._geometry_review = {
+            "corners_lens": {int(k): v.astype(np.float32).copy() for k, v in corners_dict.items()},
+            "corners_grid": corners_grid,
+            "focus_scores": np.asarray(focus_scores, dtype=np.float32).copy(),
+            "cols": int(cols),
+            "rows": int(rows),
+            "lens_h": lh,
+            "lens_w": lw,
+            "gap": gap,
+            "rgb": rgb,
+        }
+        self._set_geometry_review_controls(True)
+        self.geometry_progress_text_var.set("Review detections on Live Preview, then Accept or Refuse.")
+        self.status_var.set("Geometry detections ready for review on all 16 lenses")
+        self._render_geometry_review_preview()
+
+    def _accept_geometry_review(self) -> None:
+        rev = self._geometry_review
+        if not isinstance(rev, dict):
+            return
+        corners_lens = rev.get("corners_lens")
+        focus_scores = rev.get("focus_scores")
+        if not isinstance(corners_lens, dict) or not isinstance(focus_scores, np.ndarray):
+            self._refuse_geometry_review()
+            return
+        if len(corners_lens) != 16:
+            self.status_var.set("Incomplete geometry review; capture again")
+            self._refuse_geometry_review()
+            return
+        try:
+            target = max(1, int(self.geometry_target_var.get()))
+        except Exception:
+            target = 5
+        self.geometry_corners.append({int(k): np.asarray(v, dtype=np.float32) for k, v in corners_lens.items()})
+        self.geometry_focus_scores.append(np.asarray(focus_scores, dtype=np.float32))
+        self.geometry_capture_idx += 1
+        cols = int(rev.get("cols", self.geometry_cols_var.get()))
+        rows = int(rev.get("rows", self.geometry_rows_var.get()))
+        self._clear_geometry_review(reset_buttons=True)
+        if self.geometry_capture_idx < target:
+            self.geometry_btn_var.set(f"Capture chess frame {self.geometry_capture_idx + 1}/{target}")
+            self.geometry_progress_text_var.set(f"Accepted frame {self.geometry_capture_idx}/{target}")
+            self.status_var.set(f"Valid geometry frame accepted: {self.geometry_capture_idx}/{target}")
+            self._render_preview(force=True)
+            return
+        self.geometry_btn_var.set("Solving geometry...")
+        self.geometry_progress_var.set(5.0)
+        self.geometry_progress_text_var.set("Estimating homographies...")
+        self.status_var.set("Geometry solve started")
+        self._set_geometry_review_controls(False)
+        try:
+            self.geometry_capture_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        threading.Thread(target=self._solve_geometry_worker, args=(cols, rows), daemon=True).start()
+
+    def _refuse_geometry_review(self) -> None:
+        try:
+            target = max(1, int(self.geometry_target_var.get()))
+        except Exception:
+            target = 5
+        self._clear_geometry_review(reset_buttons=True)
+        nxt = self.geometry_capture_idx + 1
+        self.geometry_btn_var.set(f"Capture chess frame {nxt}/{target}")
+        self.geometry_progress_text_var.set("Detection refused. Capture another frame.")
+        self.status_var.set("Geometry detection refused. Capture again.")
+        self._render_preview(force=True)
+
+    def _draw_geometry_review_overlay(self) -> None:
+        if self.current_page != "calib" or self.calib_stage != "geometry":
+            return
+        rev = self._geometry_review
+        if not isinstance(rev, dict) or self._calib_display_map is None:
+            return
+        corners_grid = rev.get("corners_grid")
+        if not isinstance(corners_grid, dict):
+            return
+        cols = max(2, int(rev.get("cols", 3)))
+        rows = max(2, int(rev.get("rows", 3)))
+        self.calib_canvas.delete("geom_overlay")
+        x0, y0, s = self._calib_display_map
+        for i in range(16):
+            pts = corners_grid.get(i)
+            if pts is None:
+                continue
+            arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+            if arr.shape[0] != cols * rows:
+                continue
+            # Grid edges between adjacent inner corners.
+            for r in range(rows):
+                for c in range(cols - 1):
+                    a = arr[r * cols + c]
+                    b = arr[r * cols + c + 1]
+                    self.calib_canvas.create_line(
+                        x0 + float(a[0]) * s,
+                        y0 + float(a[1]) * s,
+                        x0 + float(b[0]) * s,
+                        y0 + float(b[1]) * s,
+                        fill="#33ff99",
+                        width=2,
+                        tags="geom_overlay",
+                    )
+            for r in range(rows - 1):
+                for c in range(cols):
+                    a = arr[r * cols + c]
+                    b = arr[(r + 1) * cols + c]
+                    self.calib_canvas.create_line(
+                        x0 + float(a[0]) * s,
+                        y0 + float(a[1]) * s,
+                        x0 + float(b[0]) * s,
+                        y0 + float(b[1]) * s,
+                        fill="#33ff99",
+                        width=2,
+                        tags="geom_overlay",
+                    )
+            for px, py in arr:
+                cx = x0 + float(px) * s
+                cy = y0 + float(py) * s
+                self.calib_canvas.create_oval(
+                    cx - 3, cy - 3, cx + 3, cy + 3, outline="#ffe066", fill="#ffe066", width=1, tags="geom_overlay"
+                )
+            cidx = (rows // 2) * cols + (cols // 2)
+            cx = x0 + float(arr[cidx, 0]) * s
+            cy = y0 + float(arr[cidx, 1]) * s
+            self.calib_canvas.create_text(cx + 6, cy - 6, text=str(i + 1), fill="#ffe066", anchor="sw", tags="geom_overlay")
+
+    def _render_geometry_review_preview(self) -> None:
+        rev = self._geometry_review
+        if not isinstance(rev, dict):
+            return
+        rgb = rev.get("rgb")
+        if not isinstance(rgb, np.ndarray):
+            return
+        photo, m = self._fit_rgb_for_canvas(rgb, self.calib_canvas, nearest=True)
+        self._calib_photo = photo
+        self._calib_display_map = m
+        self.calib_canvas.delete("all")
+        self.calib_canvas.create_image(m[0], m[1], anchor="nw", image=self._calib_photo)
+        self._draw_geometry_review_overlay()
+
     def _capture_geometry_frame(self) -> None:
+        if self._geometry_review is not None:
+            self.status_var.set("Accept or Refuse the current detection before capturing again")
+            return
         if cv2 is None:
             self.status_var.set("OpenCV is required for geometry calibration")
             return
@@ -3485,7 +4048,7 @@ class HydraWizardApp(tk.Tk):
         try:
             cols = max(2, int(self.geometry_cols_var.get()))
             rows = max(2, int(self.geometry_rows_var.get()))
-            target = max(1, int(self.geometry_target_var.get()))
+            _target = max(1, int(self.geometry_target_var.get()))
         except Exception:
             self.status_var.set("Invalid geometry settings")
             return
@@ -3495,87 +4058,100 @@ class HydraWizardApp(tk.Tk):
             self.status_var.set("Crop configuration is invalid")
             return
         work = self._apply_dark_flat(lenses)
-        corners_dict: dict[int, np.ndarray] = {}
+
+        lens_sources: list[list[tuple[str, np.ndarray]]] = []
         focus_scores = np.zeros((16,), dtype=np.float32)
         for i in range(16):
+            sources, focus = self._geometry_lens_sources(work, lenses, fmt, i)
+            lens_sources.append(sources)
+            focus_scores[i] = float(focus)
+
+        # Phase 1: full reliable search on sharpest lenses first until one seed lock.
+        seed_order = list(np.argsort(-focus_scores))
+        corners_dict: dict[int, np.ndarray] = {}
+        seed_idx: int | None = None
+        seed_method = "none"
+        self.geometry_progress_text_var.set("Phase 1: finding seed chessboard on sharpest lens...")
+        for i in seed_order:
+            lens_no = int(i) + 1
+            corners, method_used = self._detect_geometry_on_sources(
+                lens_sources[int(i)],
+                cols,
+                rows,
+                lens_no,
+                roi_hint=None,
+                fast=False,
+                mode_label="seed-full",
+            )
+            if corners is None:
+                continue
+            corners_dict[int(i)] = corners
+            seed_idx = int(i)
+            seed_method = method_used
+            if self.debug:
+                self._dbg(f"geom seed lens {lens_no}: found by {method_used} focus={focus_scores[i]:.2f}")
+            self.geometry_progress_text_var.set(f"Seed OK on lens {lens_no}. Guiding other lenses...")
+            break
+
+        if seed_idx is None:
+            self.status_var.set("Chessboard not found on any lens. Frame rejected.")
+            self.geometry_progress_text_var.set("Seed search failed on all 16 lenses.")
+            return
+
+        lh = int(work.shape[1])
+        lw = int(work.shape[2])
+        seed_roi = self._board_roi_from_corners(corners_dict[seed_idx], lw, lh, pad_ratio=0.45, min_pad=20)
+        wide_roi = self._board_roi_from_corners(corners_dict[seed_idx], lw, lh, pad_ratio=0.70, min_pad=28)
+
+        # Phase 2: guided search in the seed board region for all other lenses (no full-frame search).
+        missing: list[int] = []
+        for i in range(16):
+            if i == seed_idx:
+                continue
             lens_no = i + 1
-            gray_f = work[i]
-            u8 = raw_to_u8(np.clip(gray_f, 0, 65535).astype(np.uint16), fmt)
-            u8_stretch = raw_to_u8(np.clip(gray_f, 0, 65535).astype(np.uint16), fmt, autostretch=True)
-            # Fallback source: original RAW crop as uint8, useful if flat normalization weakens pattern contrast.
-            raw_u8 = raw_to_u8(np.asarray(lenses[i]), fmt, autostretch=False)
-            raw_u8_stretch = raw_to_u8(np.asarray(lenses[i]), fmt, autostretch=True)
-            lap = cv2.Laplacian(u8, cv2.CV_32F)
-            focus_scores[i] = float(lap.var())
-            corners = None
-            method_used = "none"
-            for src_name, src_img in (
-                ("flat_u8", u8),
-                ("flat_u8_autostretch", u8_stretch),
-                ("raw_u8", raw_u8),
-                ("raw_u8_autostretch", raw_u8_stretch),
-            ):
-                self.status_var.set(f"Geometry detect: lens {lens_no}/16, source={src_name}, method=robust(classic+sb)")
-                self.geometry_progress_text_var.set(
-                    f"Lens {lens_no}/16: source={src_name}, method=robust(classic+sb)"
-                )
-                try:
-                    self.update_idletasks()
-                except Exception:
-                    pass
-                method_ui_ts = 0.0
-
-                def _method_progress(method_name: str) -> None:
-                    nonlocal method_ui_ts
-                    now_ts = time.monotonic()
-                    if (now_ts - method_ui_ts) < 0.12:
-                        return
-                    method_ui_ts = now_ts
-                    self.geometry_progress_text_var.set(
-                        f"Lens {lens_no}/16: source={src_name}, method={method_name}"
-                    )
-                    try:
-                        self.update_idletasks()
-                    except Exception:
-                        pass
-
-                c_try, m_try = self._find_chessboard_corners_geometry(
-                    src_img,
+            corners, method_used = self._detect_geometry_on_sources(
+                lens_sources[i],
+                cols,
+                rows,
+                lens_no,
+                roi_hint=seed_roi,
+                fast=True,
+                mode_label="guided",
+            )
+            if corners is None:
+                corners, method_used = self._detect_geometry_on_sources(
+                    lens_sources[i],
                     cols,
                     rows,
-                    progress_cb=_method_progress,
+                    lens_no,
+                    roi_hint=wide_roi,
+                    fast=True,
+                    mode_label="guided-wide",
                 )
-                if c_try is not None and c_try.shape[0] == cols * rows:
-                    corners = c_try
-                    method_used = f"{src_name}:{m_try}"
-                    break
-            if corners is not None and corners.shape[0] == cols * rows:
-                corners_dict[i] = corners.astype(np.float32)
+            if corners is None:
+                missing.append(lens_no)
                 if self.debug:
-                    self._dbg(f"geom lens {lens_no}: found by {method_used}")
-            else:
-                self.status_var.set(f"Chessboard not found on lens {lens_no}. Frame rejected.")
-                self.geometry_progress_text_var.set(f"Lens {lens_no}/16 failed. Capture rejected.")
-                if self.debug:
-                    self._dbg(
-                        f"geom lens {lens_no}: chessboard not found; "
-                        f"focus={focus_scores[i]:.2f} u8[min,max]=[{int(u8.min())},{int(u8.max())}] "
-                        f"raw_u8[min,max]=[{int(raw_u8.min())},{int(raw_u8.max())}]"
-                    )
-                return
-            self.geometry_progress_text_var.set(f"Lens {lens_no}/16 OK ({method_used})")
-        self.geometry_corners.append(corners_dict)
-        self.geometry_focus_scores.append(focus_scores)
-        self.geometry_capture_idx += 1
-        if self.geometry_capture_idx < target:
-            self.geometry_btn_var.set(f"Capture chess frame {self.geometry_capture_idx + 1}/{target}")
-            self.status_var.set(f"Valid geometry frame captured: {self.geometry_capture_idx}/{target}")
+                    self._dbg(f"geom lens {lens_no}: guided search failed near seed ROI {seed_roi}")
+                continue
+            corners_dict[i] = corners
+            if self.debug:
+                self._dbg(f"geom lens {lens_no}: guided hit by {method_used}")
+            self.geometry_progress_text_var.set(
+                f"Guided OK lens {lens_no}/16 (seed={seed_idx + 1}). Locked {len(corners_dict)}/16"
+            )
+
+        if missing:
+            self.status_var.set(
+                f"Chessboard not found on lenses: {', '.join(str(x) for x in missing)} "
+                f"(seed was lens {seed_idx + 1}). Frame rejected."
+            )
+            self.geometry_progress_text_var.set(
+                f"Guided search failed on {len(missing)} lens(es). Seed={seed_idx + 1}."
+            )
             return
-        self.geometry_btn_var.set("Solving geometry...")
-        self.geometry_progress_var.set(5.0)
-        self.geometry_progress_text_var.set("Estimating homographies...")
-        self.status_var.set("Geometry solve started")
-        threading.Thread(target=self._solve_geometry_worker, args=(cols, rows), daemon=True).start()
+
+        self.status_var.set(f"All 16 boards locked (seed lens {seed_idx + 1}: {seed_method})")
+        self._enter_geometry_review(corners_dict, focus_scores, cols, rows, work, fmt)
 
     def _solve_geometry_worker(self, cols: int, rows: int) -> None:
         if cv2 is None:
@@ -4170,6 +4746,26 @@ class HydraWizardApp(tk.Tk):
         finally:
             self._push_ui_event("analysis_state", {"analyze_ready_check": True})
 
+    def _demo_classification_available(self) -> bool:
+        try:
+            lens_ok = 1 <= int(self.face_seg_lens_var.get()) <= 16
+        except Exception:
+            lens_ok = False
+        crop_ok = isinstance(self.crop_boxes, list) and len(self.crop_boxes) == 16
+        geometry_ok = (not self.geometry_correction_enabled) or self.geometry_h is not None
+        return bool(
+            self.last_frame is not None
+            and crop_ok
+            and geometry_ok
+            and self.white_point_ref is not None
+            and self._face_seg_model_ready
+            and self._face_cls_model_ready
+            and self._analysis_recon_ready
+            and lens_ok
+            and not self._analysis_busy
+            and not self._analysis_mode
+        )
+
     def _update_analyze_button_state(self) -> None:
         if not hasattr(self, "close_analysis_btn"):
             return
@@ -4211,6 +4807,14 @@ class HydraWizardApp(tk.Tk):
             else:
                 self.classify_button_var.set("Classification")
             self.classify_btn.state(["!disabled"] if analyze_clickable else ["disabled"])
+        if hasattr(self, "demo_btn"):
+            if self._demo_active:
+                self.demo_button_var.set("Остановить демо-режим")
+                self.demo_btn.state(["!disabled"])
+            else:
+                self.demo_button_var.set("Демо-режим")
+                demo_ready = can_classify and self._demo_classification_available()
+                self.demo_btn.state(["!disabled"] if demo_ready else ["disabled"])
         if self._analysis_mode:
             self.close_analysis_btn.state(["!disabled"])
             if hasattr(self, "analysis_rotate_btn"):
@@ -4241,7 +4845,9 @@ class HydraWizardApp(tk.Tk):
             time.sleep(0.01)
         return False
 
-    def _close_analysis_mode(self) -> None:
+    def _close_analysis_mode(self, stop_demo: bool = True) -> None:
+        if stop_demo:
+            self._stop_demo_mode()
         self._analysis_mode = False
         self._analysis_base_rgb = None
         self._analysis_view_rgb = None
@@ -4334,34 +4940,149 @@ class HydraWizardApp(tk.Tk):
     def _weights_dir(self) -> Path:
         return Path(__file__).resolve().parents[1] / "weights"
 
-    def _start_classification(self) -> None:
-        self._start_analysis(fas_force_live=None, use_real_classifier=True)
+    def _start_classification(self) -> bool:
+        return self._start_analysis(fas_force_live=None, use_real_classifier=True)
 
-    def _start_analysis(self, fas_force_live: bool | None = None, use_real_classifier: bool = False) -> None:
+    def _toggle_demo_mode(self) -> None:
+        if self._demo_active:
+            self._stop_demo_mode("Демо-режим остановлен")
+            return
+        self._start_demo_mode()
+
+    def _start_demo_mode(self) -> None:
+        if not self._demo_classification_available():
+            self.status_var.set("Демо-режим недоступен: Classification не готов к запуску")
+            self._update_analyze_button_state()
+            return
+        self._demo_active = True
+        self._demo_points_shown = 0
+        self._demo_used_points.clear()
+        self._cancel_demo_timer()
+        self._update_analyze_button_state()
+        if not self._start_demo_analysis():
+            self._stop_demo_mode()
+
+    def _start_demo_analysis(self) -> bool:
+        return self._start_analysis(fas_force_live=None, use_real_classifier=False, demo_mode=True)
+
+    def _cancel_demo_timer(self) -> None:
+        after_id = self._demo_after_id
+        self._demo_after_id = None
+        if after_id is None:
+            return
+        try:
+            self.after_cancel(after_id)
+        except Exception:
+            pass
+
+    def _stop_demo_mode(self, status: str | None = None) -> None:
+        self._cancel_demo_timer()
+        self._demo_active = False
+        self._demo_points_shown = 0
+        self._demo_used_points.clear()
+        if status:
+            self.status_var.set(status)
+        if hasattr(self, "demo_btn"):
+            self._update_analyze_button_state()
+
+    def _random_demo_point(self) -> tuple[int, int] | None:
+        hsi = self._analysis_hsi_hwc
+        if hsi is None or hsi.ndim != 3:
+            return None
+        h, w = int(hsi.shape[0]), int(hsi.shape[1])
+        if h <= 0 or w <= 0:
+            return None
+        margin_x = 2 if w >= 5 else 0
+        margin_y = 2 if h >= 5 else 0
+        x_min, x_max = margin_x, max(margin_x, w - 1 - margin_x)
+        y_min, y_max = margin_y, max(margin_y, h - 1 - margin_y)
+        candidate_count = (x_max - x_min + 1) * (y_max - y_min + 1)
+        if len(self._demo_used_points) >= candidate_count:
+            return None
+        for _attempt in range(32):
+            point = (random.randint(x_min, x_max), random.randint(y_min, y_max))
+            if point not in self._demo_used_points:
+                return point
+        for y in range(y_min, y_max + 1):
+            for x in range(x_min, x_max + 1):
+                point = (x, y)
+                if point not in self._demo_used_points:
+                    return point
+        return None
+
+    def _demo_analysis_done(self) -> None:
+        if not self._demo_active:
+            return
+        self._cancel_demo_timer()
+        self._demo_points_shown = 0
+        self._demo_used_points.clear()
+        self._demo_show_next_point()
+
+    def _demo_show_next_point(self) -> None:
+        self._demo_after_id = None
+        if not self._demo_active or not self._analysis_mode:
+            return
+        point = self._random_demo_point()
+        if point is None:
+            self._stop_demo_mode("Демо-режим остановлен: нет доступных точек для спектра")
+            return
+        self._demo_used_points.add(point)
+        self._demo_points_shown += 1
+        if not self._sample_analysis_point(
+            point[0],
+            point[1],
+            status=(
+                f"Демо-режим: точка {self._demo_points_shown}/{DEMO_POINT_COUNT} "
+                f"({point[0]}, {point[1]})"
+            ),
+        ):
+            self._stop_demo_mode()
+            return
+        if self._demo_points_shown < DEMO_POINT_COUNT:
+            self._demo_after_id = self.after(DEMO_POINT_INTERVAL_MS, self._demo_show_next_point)
+        else:
+            self._demo_after_id = self.after(DEMO_POINT_INTERVAL_MS, self._demo_restart_analysis)
+
+    def _demo_restart_analysis(self) -> None:
+        self._demo_after_id = None
+        if not self._demo_active:
+            return
+        self._close_analysis_mode(stop_demo=False)
+        self._demo_points_shown = 0
+        self._demo_used_points.clear()
+        if not self._start_demo_analysis():
+            self._stop_demo_mode()
+
+    def _start_analysis(
+        self,
+        fas_force_live: bool | None = None,
+        use_real_classifier: bool = False,
+        demo_mode: bool = False,
+    ) -> bool:
         if self._analysis_busy:
             self.status_var.set("Analysis is already running")
-            return
+            return False
         if self._analysis_mode:
             self.status_var.set("Close analysis mode before running a new analysis")
-            return
+            return False
         if use_real_classifier and (not self._face_cls_model_ready):
             msg = self._face_cls_model_error or "face classifier model is not ready"
             self.status_var.set(f"Classification unavailable: {msg}")
             self._update_analyze_button_state()
-            return
+            return False
         if self.white_point_ref is None:
             self.status_var.set("Analysis unavailable: set white point first")
             self._update_analyze_button_state()
-            return
-        if not self._face_seg_model_ready:
+            return False
+        if not demo_mode and not self._face_seg_model_ready:
             self.status_var.set("Analysis unavailable: face segmentation model is not ready")
             self._update_analyze_button_state()
-            return
+            return False
         if not self._analysis_recon_checked:
             self._start_analysis_recon_precheck()
             self.status_var.set("Analysis unavailable: reconstruction precheck is running, try again")
             self._update_analyze_button_state()
-            return
+            return False
         if not self._analysis_recon_ready:
             msg = self._analysis_recon_error or "reconstruction stack is unavailable"
             self.status_var.set(f"Analysis unavailable: {msg}")
@@ -4370,36 +5091,49 @@ class HydraWizardApp(tk.Tk):
             except Exception:
                 pass
             self._update_analyze_button_state()
-            return
-        lens_idx = int(self.face_seg_lens_var.get())
-        if lens_idx < 1 or lens_idx > 16:
-            self.status_var.set("Analysis unavailable: set segmentation lens (1..16)")
-            self._update_analyze_button_state()
-            return
+            return False
+        if not demo_mode:
+            lens_idx = int(self.face_seg_lens_var.get())
+            if lens_idx < 1 or lens_idx > 16:
+                self.status_var.set("Analysis unavailable: set segmentation lens (1..16)")
+                self._update_analyze_button_state()
+                return False
         if self.last_frame is None:
             self.status_var.set("Analysis unavailable: no live frame")
-            return
+            return False
         self._analysis_busy = True
         self._update_analyze_button_state()
-        if use_real_classifier:
+        if demo_mode:
+            self.status_var.set("Демо-режим: построение HSI-куба...")
+        elif use_real_classifier:
             self.status_var.set("Classification started: building reflectance cube...")
         else:
             self.status_var.set("Analysis started: building reflectance cube...")
         threading.Thread(
             target=self._analysis_worker,
-            args=(fas_force_live, use_real_classifier),
+            args=(fas_force_live, use_real_classifier, demo_mode),
             name="hydra-analysis",
             daemon=True,
         ).start()
+        return True
 
-    def _analysis_worker(self, fas_force_live: bool | None = None, use_real_classifier: bool = False) -> None:
+    def _analysis_worker(
+        self,
+        fas_force_live: bool | None = None,
+        use_real_classifier: bool = False,
+        demo_mode: bool = False,
+    ) -> None:
         try:
-            inputs = self._build_analysis_inputs()
-            seg_rgb = inputs["seg_rgb"]
+            inputs = self._build_analysis_inputs(include_seg_rgb=not demo_mode)
             reflectance = inputs["reflectance"]
-            self._push_ui_event("status", "Analysis: running face segmentation...")
-            mask = self._segment_face_single(seg_rgb, confidence=0.5)
-            self._push_ui_event("status", "Analysis: running HSI reconstruction...")
+            mask = None
+            if not demo_mode:
+                self._push_ui_event("status", "Analysis: running face segmentation...")
+                mask = self._segment_face_single(inputs["seg_rgb"], confidence=0.5)
+            self._push_ui_event(
+                "status",
+                "Демо-режим: реконструкция HSI..." if demo_mode else "Analysis: running HSI reconstruction...",
+            )
             restored_hsi, analysis_tmp_dir = self._run_hsi_reconstruction(reflectance)
             wavelengths = self._load_wavelengths_for_hsi(restored_hsi.shape[2])
             base_rgb = self._synthesize_rgb_from_hsi(restored_hsi, wavelengths=wavelengths)
@@ -4456,7 +5190,7 @@ class HydraWizardApp(tk.Tk):
                     "fas_is_live": fas_is_live,
                     "fas_score": fas_score,
                     "face_spectrum_json": face_spectrum_json_path,
-                    "run_mode": "classification" if use_real_classifier else "analysis",
+                    "run_mode": "demo" if demo_mode else ("classification" if use_real_classifier else "analysis"),
                 },
             )
         except Exception as exc:
@@ -4464,7 +5198,7 @@ class HydraWizardApp(tk.Tk):
         finally:
             self._push_ui_event("analysis_state", {"busy": False, "analyze_ready_check": True})
 
-    def _build_analysis_inputs(self) -> dict[str, np.ndarray]:
+    def _build_analysis_inputs(self, include_seg_rgb: bool = True) -> dict[str, np.ndarray]:
         if self.last_frame is None:
             raise RuntimeError("No frame for analysis")
         if self.crop_boxes is None or len(self.crop_boxes) != 16:
@@ -4538,12 +5272,14 @@ class HydraWizardApp(tk.Tk):
         safe_ref = np.maximum(ref_out.astype(np.float32), 1e-6)[:, None, None]
         reflectance = np.clip(cube_out.astype(np.float32) / safe_ref, 0.0, 1.0).astype(np.float32)
 
-        lens_num = int(self.face_seg_lens_var.get())
-        if lens_num < 1 or lens_num > 16:
-            raise RuntimeError("Segmentation lens is not set")
-        lens_idx = lens_num - 1
-        seg_rgb = np.clip(lens_rgb[lens_idx], 0, 255).astype(np.uint8)
-        return {"reflectance": reflectance, "seg_rgb": seg_rgb}
+        result = {"reflectance": reflectance}
+        if include_seg_rgb:
+            lens_num = int(self.face_seg_lens_var.get())
+            if lens_num < 1 or lens_num > 16:
+                raise RuntimeError("Segmentation lens is not set")
+            lens_idx = lens_num - 1
+            result["seg_rgb"] = np.clip(lens_rgb[lens_idx], 0, 255).astype(np.uint8)
+        return result
 
     def _segment_face_single(self, rgb: np.ndarray, confidence: float = 0.5) -> "np.ndarray | None":
         with self._face_seg_model_lock:
@@ -4877,6 +5613,24 @@ class HydraWizardApp(tk.Tk):
         self._analysis_image_width = int(w)
         return combined
 
+    def _sample_analysis_point(self, x: int, y: int, status: str | None = None) -> bool:
+        hsi = self._analysis_hsi_hwc
+        if not self._analysis_mode or hsi is None:
+            return False
+        h, w, _c = hsi.shape
+        xh = max(0, min(w - 1, int(x)))
+        yh = max(0, min(h - 1, int(y)))
+        try:
+            spectrum = self._spectrum_from_point(hsi, xh, yh, half=2)
+            self._analysis_pick_xy = (xh, yh)
+            self._analysis_spectrum = spectrum
+            self._refresh_analysis_view()
+            self.status_var.set(status or f"Point spectrum sampled at ({xh}, {yh})")
+            return True
+        except Exception as exc:
+            self.status_var.set(f"Spectrum sampling failed: {exc}")
+            return False
+
     def _on_analysis_canvas_click(self, event: tk.Event) -> None:
         if not self._analysis_mode or self._analysis_hsi_hwc is None:
             return
@@ -4891,14 +5645,8 @@ class HydraWizardApp(tk.Tk):
         h, w, _c = hsi.shape
         xh = int(round((float(xi) / max(1.0, float(self._analysis_image_width - 1))) * float(max(1, w - 1))))
         yh = int(round((float(yi) / max(1.0, float(h - 1))) * float(max(1, h - 1))))
-        try:
-            spectrum = self._spectrum_from_point(hsi, xh, yh, half=2)
-            self._analysis_pick_xy = (xh, yh)
-            self._analysis_spectrum = spectrum
-            self._refresh_analysis_view()
-            self.status_var.set(f"Point spectrum sampled at ({xh}, {yh})")
-        except Exception as exc:
-            self.status_var.set(f"Spectrum sampling failed: {exc}")
+        self._stop_demo_mode()
+        self._sample_analysis_point(xh, yh)
 
     def _draw_analysis_to_main_canvas(self) -> None:
         if self._analysis_view_rgb is None:
@@ -5432,6 +6180,13 @@ class HydraWizardApp(tk.Tk):
                 except queue.Empty:
                     break
             return
+        if self.current_page == "calib" and self.calib_stage == "geometry" and self._geometry_review is not None:
+            while True:
+                try:
+                    self._render_out_q.get_nowait()
+                except queue.Empty:
+                    break
+            return
         latest: dict[str, object] | None = None
         while True:
             try:
@@ -5466,6 +6221,7 @@ class HydraWizardApp(tk.Tk):
             self.calib_canvas.delete("all")
             self.calib_canvas.create_image(m[0], m[1], anchor="nw", image=self._calib_photo)
             self._draw_crop_overlay()
+            self._draw_geometry_review_overlay()
         elif page == "main":
             photo, m = self._fit_rgb_for_canvas(rgb, self.main_canvas, nearest=True)
             self._main_photo = photo
@@ -5499,6 +6255,9 @@ class HydraWizardApp(tk.Tk):
 
     def _render_preview(self, force: bool = False) -> None:
         if self._analysis_mode:
+            return
+        if self.current_page == "calib" and self.calib_stage == "geometry" and self._geometry_review is not None:
+            self._render_geometry_review_preview()
             return
         if self.last_frame is None:
             return
@@ -5712,7 +6471,9 @@ class HydraWizardApp(tk.Tk):
                 self._analysis_pick_xy = None
                 self._refresh_analysis_view()
                 face_found = bool(payload_d.get("face_found", False))
-                if face_found:
+                if run_mode == "demo":
+                    self.status_var.set("Демо-режим: реконструкция HSI завершена")
+                elif face_found:
                     fas_txt = self._analysis_fas_label or "Face status unavailable"
                     if fas_score is not None:
                         fas_txt = f"{fas_txt} (p_live={fas_score:.3f})"
@@ -5726,7 +6487,13 @@ class HydraWizardApp(tk.Tk):
                     prefix = "Classification" if run_mode == "classification" else "Analysis"
                     self.status_var.set(f"{prefix} done: face not detected. Click image to sample 5x5 spectrum.")
                 self._update_analyze_button_state()
+                if self._demo_active:
+                    if run_mode == "demo":
+                        self._demo_analysis_done()
+                    else:
+                        self._stop_demo_mode()
             elif kind == "analysis_error":
+                self._stop_demo_mode()
                 self._analysis_busy = False
                 self._analysis_mode = False
                 self._analysis_fas_label = None
@@ -5894,6 +6661,7 @@ class HydraWizardApp(tk.Tk):
     # ----------------------------- Lifecycle -----------------------------
     def _on_close(self) -> None:
         try:
+            self._stop_demo_mode()
             with self._recon_worker_lock:
                 self._stop_recon_worker_locked()
             self._render_stop_event.set()
